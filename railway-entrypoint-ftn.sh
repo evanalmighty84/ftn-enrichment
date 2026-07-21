@@ -9,7 +9,8 @@
 #
 #   1. export HOME / XDG_RUNTIME_DIR / TMPDIR (on the Railway volume so the
 #      persistent browser profile survives restarts)
-#   2. build DATABASE_URL from DB_* vars (node one-liner, sslmode=require) if
+#   2. build DATABASE_URL from DB_* vars (node one-liner, bare URL — no
+#      sslmode; the script's Pool sets ssl:{rejectUnauthorized:false}) if
 #      DATABASE_URL is not already set
 #   3. start Xvfb on DISPLAY=:99 for headless chromium
 #   4. verify / install chromium + its system deps
@@ -54,10 +55,14 @@ log "TMPDIR=${TMPDIR}"
 # 2. Build DATABASE_URL from DB_* vars if not already set
 # ----------------------------------------------------------------------------
 # Same node one-liner pattern the Multilogin scraper's entrypoint uses:
-# compose a postgres:// URL with sslmode=require when DATABASE_URL is unset but
-# the individual DB_* vars are present. ssl rejectUnauthorized:false is applied
-# in the script's pool config; the URL just carries sslmode=require so the
-# driver negotiates SSL.
+# compose a plain postgres:// URL from the DB_* vars when DATABASE_URL is
+# unset. We deliberately do NOT append ?sslmode=require: in the installed pg
+# version sslmode=require is treated as verify-full (see the SECURITY WARNING
+# pg emits), which forces full RDS certificate verification and fails with
+# "unable to get local issuer certificate" because the container has no
+# matching CA. The script's Pool sets ssl:{rejectUnauthorized:false} itself,
+# which is what the Phase 1 Heroku backend relies on to connect to this same
+# DB — so we leave SSL handling entirely to the script and keep the URL bare.
 if [ -z "${DATABASE_URL:-}" ]; then
     if [ -n "${DB_USER:-}" ] && [ -n "${DB_HOST:-}" ] && [ -n "${DB_NAME:-}" ]; then
         export DATABASE_URL="$(
@@ -67,7 +72,7 @@ if [ -z "${DATABASE_URL:-}" ]; then
                 const h = process.env.DB_HOST || "";
                 const port = process.env.DB_PORT || 5432;
                 const n = encodeURIComponent(process.env.DB_NAME || "");
-                process.stdout.write(`postgres://${u}:${p}@${h}:${port}/${n}?sslmode=require`);
+                process.stdout.write(`postgres://${u}:${p}@${h}:${port}/${n}`);
             '
         )"
         log "built DATABASE_URL from DB_* vars (host=${DB_HOST}, db=${DB_NAME}, port=${DB_PORT:-5432})"
