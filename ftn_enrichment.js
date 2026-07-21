@@ -15,9 +15,12 @@ require("dotenv").config();
 // verbatim from the proven script — only the DB selection query and Railway
 // connectivity were adapted.
 //
-// Selection (Phase 2): rows WHERE is_lead = true AND mobile_phone IS NULL,
+// Selection (Phase 2): rows WHERE is_lead = true AND ftn_enriched_at IS NULL,
 // ordered newest-first (id DESC). Sonar (Phase 1) already set is_lead /
-// enrichment / enrichment_status='lead' on these rows.
+// enrichment / enrichment_status='lead' on these rows. Phase 2 marks each
+// processed lead via its OWN column ftn_enriched_at (a migration adds
+// ftn_enriched_at / ftn_enrichment_status) and captures found people into
+// familytreenow (with routed contractors) instead of writing leads.mobile_phone.
 // ---------------------------------------------------------------------------
 
 const fs = require("fs");
@@ -37,16 +40,16 @@ function buildPool() {
         process.env.DATABASE_URL ||
         (process.env.DB_USER && process.env.DB_HOST && process.env.DB_NAME
             ? `postgres://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(
-                  process.env.DB_PASSWORD || "",
-              )}@${process.env.DB_HOST}:${process.env.DB_PORT || 5432}/${encodeURIComponent(
-                  process.env.DB_NAME,
-              )}`
+                process.env.DB_PASSWORD || "",
+            )}@${process.env.DB_HOST}:${process.env.DB_PORT || 5432}/${encodeURIComponent(
+                process.env.DB_NAME,
+            )}`
             : null);
 
     if (!connectionString) {
         throw new Error(
             "No Postgres connection configured. Set DATABASE_URL or " +
-                "DB_USER/DB_HOST/DB_NAME/DB_PASSWORD/DB_PORT.",
+            "DB_USER/DB_HOST/DB_NAME/DB_PASSWORD/DB_PORT.",
         );
     }
 
@@ -62,6 +65,14 @@ const TABLE_NAME = "unfiltered_general_contracting";
 const FTN_HOME_URL = "https://www.familytreenow.com/";
 
 const MAX_ROWS = Number(process.env.FTN_MAX_ROWS || 50);
+
+// Contractor routing proximity threshold (miles). Distinct from the FTN
+// nearby-result tier (FTN_NEARBY_CITY_MILES, default 35): this one governs how
+// close a contractor's subscribed_areas city must be to the lead's resolved
+// city to qualify when no exact city match exists.
+const NEARBY_CONTRACTOR_MILES = Number(
+    process.env.FTN_CONTRACTOR_NEARBY_MILES || 20,
+);
 const MIN_DELAY_MS = Number(process.env.FTN_MIN_DELAY_MS || 2500);
 const MAX_DELAY_MS = Number(process.env.FTN_MAX_DELAY_MS || 4500);
 
@@ -132,6 +143,7 @@ const LOCATION_OVERRIDES = {
     "villages of preston glen": "Plano",
     "waterford trails": "Frisco",
     "villas of el dorado": "Allen",
+    "ridgeview ranch": "Plano",
     // "pine ridge estates": "",
     // "plantation estates": "",
     // "cottonwood bend": "",
@@ -350,20 +362,23 @@ function parseReportedDate(text = "") {
 }
 
 async function getRowsToEnrich() {
-    // Phase 2: target only Sonar-confirmed leads that still lack a mobile
-    // phone. is_lead is set by Phase 1 (Sonar); mobile_phone IS NULL means
-    // FTN has not yet enriched the row. Newest rows first (id DESC) so fresh
-    // leads are prioritized. author/city/state must be present for a lookup.
+    // Phase 2: target only Sonar-confirmed leads (is_lead=true, set by Phase 1)
+    // that Phase 2 has not yet processed. We use ftn_enriched_at (timestamptz),
+    // a dedicated Phase-2-owned column, as the processed marker — NOT enriched_at
+    // / enrichment_status / enrichment, which Phase 1 owns. Newest rows first
+    // (id DESC) so fresh leads are prioritized. author/city/state must be present
+    // for a lookup. lead_type feeds contractor routing on insert.
     const { rows } = await pool.query(
         `
             SELECT
                 id,
                 author,
                 city,
-                state
+                state,
+                lead_type
             FROM ${TABLE_NAME}
             WHERE is_lead = true
-              AND mobile_phone IS NULL
+              AND ftn_enriched_at IS NULL
               AND author IS NOT NULL
               AND city IS NOT NULL
               AND state IS NOT NULL
@@ -376,18 +391,272 @@ async function getRowsToEnrich() {
     return rows;
 }
 
-async function updateMobilePhone(id, phone) {
+// Mark a lead as processed by Phase 2 so it is never re-picked. Writes the
+// dedicated Phase-2-owned columns ftn_enriched_at / ftn_enrichment_status; the
+// ftn_enriched_at IS NULL guard makes this idempotent under concurrent workers.
+// Does NOT touch mobile_phone or the Phase-1-owned enriched_at /
+// enrichment_status / enrichment columns.
+async function markLeadProcessed(id, enrichmentStatus) {
     const { rowCount } = await pool.query(
         `
             UPDATE ${TABLE_NAME}
-            SET mobile_phone = $1
+            SET ftn_enriched_at = now(),
+                ftn_enrichment_status = $1
             WHERE id = $2
-              AND mobile_phone IS NULL
+              AND ftn_enriched_at IS NULL
         `,
-        [phone, id],
+        [enrichmentStatus, id],
     );
 
     return rowCount > 0;
+}
+
+// Normalize a Postgres text[] (or stray scalar) into lowercased, trimmed,
+// non-empty strings for case-insensitive comparison. Never splits an element
+// on commas — malformed comma-joined entries are compared as-is.
+function normalizeStringArray(value) {
+    const arr = Array.isArray(value)
+        ? value
+        : value == null || value === ""
+            ? []
+            : [value];
+
+    return arr
+        .map((item) => cleanText(item).toLowerCase())
+        .filter(Boolean);
+}
+
+// familytreenow.lead_type is a single text column. Join a text[] lead_type with
+// commas (dropping empties); return null for empty/absent so the column is NULL.
+function formatLeadTypeForFamilyTreeNow(leadType) {
+    if (Array.isArray(leadType)) {
+        const parts = leadType
+            .map((item) => cleanText(item))
+            .filter(Boolean);
+
+        return parts.length ? parts.join(",") : null;
+    }
+
+    const single = cleanText(leadType);
+    return single || null;
+}
+
+// All verified contractors, fetched once per worker process and cached so we
+// don't re-query users for every lead in the batch.
+let VERIFIED_CONTRACTORS = null;
+
+async function getVerifiedContractors() {
+    if (VERIFIED_CONTRACTORS) {
+        return VERIFIED_CONTRACTORS;
+    }
+
+    const { rows } = await pool.query(
+        `
+            SELECT
+                id,
+                name,
+                company_name,
+                phone_number,
+                industry,
+                subscribed_areas,
+                state
+            FROM users
+            WHERE verified = true
+        `,
+    );
+
+    VERIFIED_CONTRACTORS = rows;
+    return rows;
+}
+
+// Given a lead's lead_type[] and resolved city/state, find verified contractors
+// to route this lead to. Returns parallel arrays for familytreenow's
+// company_name[] and professionalnumbertocall[]. Matching is case-insensitive:
+//   0. STATE: contractor.state must equal the lead state (when both present) —
+//      "Arlington" exists in TX and VA, so an out-of-state contractor must not
+//      route a TX lead.
+//   1. INDUSTRY: contractor.industry[] must intersect lead.lead_type[], after
+//      normalizing both sides (spaces AND hyphens → underscores) so users data
+//      like "general contractor" matches canonical "general_contractor".
+//   2. PHONE: only contractors with a non-empty phone_number are routable — a
+//      phoneless contractor is excluded entirely and never suppresses nearby.
+//   3. CITY (exact): expanded subscribed_areas contains the resolved city.
+//   4. CITY (nearby): only if exact matched nobody — an expanded subscribed_areas
+//      city is within NEARBY_CONTRACTOR_MILES of the resolved city (seed-geocoded).
+async function routeContractors(leadType, resolvedCity, state) {
+    const empty = { companyNames: [], phones: [] };
+
+    // Industry tokens: lowercase + trim (via normalizeStringArray) then map
+    // spaces AND hyphens to underscores so canonical/legacy spellings unify.
+    const toIndustryTokens = (value) =>
+        normalizeStringArray(value).map((item) =>
+            item.replace(/[\s-]+/g, "_"),
+        );
+
+    const leadTypes = toIndustryTokens(leadType);
+
+    if (!leadTypes.length) {
+        return empty;
+    }
+
+    const leadTypeSet = new Set(leadTypes);
+    const leadState = cleanText(state).toUpperCase();
+    const contractors = await getVerifiedContractors();
+
+    // (0) State filter — require equality when both states are present. A
+    // missing contractor state does not disqualify (can't prove a mismatch).
+    const stateMatched = contractors.filter((contractor) => {
+        const contractorState = cleanText(contractor.state).toUpperCase();
+
+        if (!leadState || !contractorState) {
+            return true;
+        }
+
+        return contractorState === leadState;
+    });
+
+    // (1) Industry filter.
+    const industryMatched = stateMatched.filter((contractor) =>
+        toIndustryTokens(contractor.industry).some((industry) =>
+            leadTypeSet.has(industry),
+        ),
+    );
+
+    // (2) Usable-phone filter, applied BEFORE city matching so phoneless
+    // contractors neither route nor suppress the nearby fallback.
+    const routable = industryMatched.filter((contractor) => {
+        const phone =
+            contractor.phone_number == null
+                ? ""
+                : String(contractor.phone_number).trim();
+
+        return phone.length > 0;
+    });
+
+    if (!routable.length) {
+        return empty;
+    }
+
+    // Expand each contractor's subscribed_areas: split every element on ",",
+    // trim each piece, drop empties, lowercase. Handles the malformed
+    // single comma-joined string (e.g. "Allen,Plano,Garland,...").
+    const expandedAreas = (contractor) => {
+        const raw = Array.isArray(contractor.subscribed_areas)
+            ? contractor.subscribed_areas
+            : contractor.subscribed_areas == null ||
+            contractor.subscribed_areas === ""
+                ? []
+                : [contractor.subscribed_areas];
+
+        const out = [];
+
+        for (const element of raw) {
+            for (const piece of String(element).split(",")) {
+                const cityPiece = cleanText(piece).toLowerCase();
+                if (cityPiece) {
+                    out.push(cityPiece);
+                }
+            }
+        }
+
+        return out;
+    };
+
+    const cityKey = cleanText(resolvedCity).toLowerCase();
+
+    // (3) Exact city tier.
+    let matched = routable.filter((contractor) =>
+        expandedAreas(contractor).includes(cityKey),
+    );
+
+    if (!matched.length) {
+        // (4) Nearby tier. A subscribed city missing from the coordinate seed
+        // geocodes to null and cannot participate — only exact match applies.
+        const target = await geocodeCity(resolvedCity, state);
+
+        if (target) {
+            const nearby = [];
+
+            for (const contractor of routable) {
+                let isNear = false;
+
+                for (const area of expandedAreas(contractor)) {
+                    const coord = await geocodeCity(area, state);
+
+                    if (
+                        coord &&
+                        haversineMiles(target, coord) <=
+                        NEARBY_CONTRACTOR_MILES
+                    ) {
+                        isNear = true;
+                        break;
+                    }
+                }
+
+                if (isNear) {
+                    nearby.push(contractor);
+                }
+            }
+
+            matched = nearby;
+        }
+    }
+
+    const companyNames = [];
+    const phones = [];
+    const seenPhones = new Set();
+
+    for (const contractor of matched) {
+        const phone = String(contractor.phone_number).trim();
+
+        // Dedupe by phone_number (case-insensitive), preserving order. Every
+        // contractor in `matched` already has a non-empty phone (routable).
+        const key = phone.toLowerCase();
+        if (seenPhones.has(key)) {
+            continue;
+        }
+        seenPhones.add(key);
+
+        companyNames.push(contractor.company_name ?? null);
+        phones.push(contractor.phone_number);
+    }
+
+    return { companyNames, phones };
+}
+
+// Insert the matched FTN person + chosen phone + routed contractors into
+// familytreenow. Only called when a phone was found. company_name and
+// professionalnumbertocall are text[]; pg maps JS arrays directly.
+async function insertFamilyTreeNowRow({
+                                          author,
+                                          city,
+                                          state,
+                                          address,
+                                          phone,
+                                          companyNames,
+                                          phones,
+                                          leadType,
+                                      }) {
+    await pool.query(
+        `
+            INSERT INTO familytreenow
+                (author, city, state, address, phone, email,
+                 company_name, professionalnumbertocall,
+                 lead_type, scraped_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+        `,
+        [
+            author,
+            city,
+            state,
+            address ?? null,
+            phone,
+            null,
+            companyNames,
+            phones,
+            formatLeadTypeForFamilyTreeNow(leadType),
+        ],
+    );
 }
 
 async function findVisibleInput(page, selectors) {
@@ -1485,7 +1754,7 @@ async function solveFamilyTreeNowTurnstile(page) {
         console.log(
             `🔐 Solving Cloudflare Turnstile ` +
             `(sitekey ${sitekey}) via 2captcha... ` +
-                `callback captured: ${callbackCaptured}.`,
+            `callback captured: ${callbackCaptured}.`,
         );
 
         const solution = await solveTurnstileVia2Captcha(task);
@@ -1559,7 +1828,7 @@ async function solveFamilyTreeNowTurnstile(page) {
     if (await isOnCaptchaPage(page)) {
         throw new Error(
             "Turnstile submit did not leave the captcha page " +
-                `(after ${Date.now() - solveStart}ms).`,
+            `(after ${Date.now() - solveStart}ms).`,
         );
     }
 
@@ -1673,7 +1942,7 @@ async function getFamilyTreeNowResults(page, person, city, state) {
             const links = Array.from(
                 document.querySelectorAll(
                     "a.detail-link[href], a[data-perma-link][href], " +
-                        "a[href*='/record/'], a[href*='/search/people/']",
+                    "a[href*='/record/'], a[href*='/search/people/']",
                 ),
             ).filter((element) => {
                 // Skip hidden/template duplicate links so dedupe-by-href
@@ -1806,9 +2075,9 @@ async function getFamilyTreeNowResults(page, person, city, state) {
         // genuinely different names like Christa vs Kristina Roth.
         const nameMatches =
             firstNameSegment(resultName) ===
-                firstNameSegment(person.fullName) &&
+            firstNameSegment(person.fullName) &&
             lastNameSegment(resultName) ===
-                lastNameSegment(person.fullName);
+            lastNameSegment(person.fullName);
 
         const cityMatches =
             normalizeLocationForComparison(livesInCity) ===
@@ -1830,10 +2099,10 @@ async function getFamilyTreeNowResults(page, person, city, state) {
             ) &&
             (expectedState
                 ? new RegExp(
-                      `\b${escapeRegex(
-                          expectedState.toLowerCase(),
-                      )}\b`,
-                  ).test(livedInNormalized)
+                    `\b${escapeRegex(
+                        expectedState.toLowerCase(),
+                    )}\b`,
+                ).test(livedInNormalized)
                 : true);
 
         results.push({
@@ -2014,9 +2283,9 @@ async function geocodeCity(city, state) {
             const hit = Array.isArray(data) ? data[0] : null;
             const coord = hit
                 ? {
-                      lat: parseFloat(hit.lat),
-                      lon: parseFloat(hit.lon),
-                  }
+                    lat: parseFloat(hit.lat),
+                    lon: parseFloat(hit.lon),
+                }
                 : null;
 
             CITY_COORDS.set(cityNorm, coord);
@@ -2154,7 +2423,7 @@ async function chooseFamilyTreeNowResults(
         if (!result.resultName && !result.livesInCity) {
             console.log(
                 `   🔎 [diag] unparseable result card — ` +
-                    `raw: ${(result.cardText || "").slice(0, 220)}`,
+                `raw: ${(result.cardText || "").slice(0, 220)}`,
             );
         }
     }
@@ -2315,7 +2584,7 @@ async function dismissVignette(page) {
             document
                 .querySelectorAll(
                     "iframe[id*='google'], iframe[name*='google'], " +
-                        "#google_vignette, .adsbygoogle",
+                    "#google_vignette, .adsbygoogle",
                 )
                 .forEach((element) => element.remove());
         })
@@ -2365,11 +2634,11 @@ async function clickViewDetailsLink(page, targetHref) {
 
                 const match = href
                     ? links.find(
-                          (el) =>
-                              el.href === href ||
-                              el.href.split("#")[0] ===
-                                  href.split("#")[0],
-                      )
+                        (el) =>
+                            el.href === href ||
+                            el.href.split("#")[0] ===
+                            href.split("#")[0],
+                    )
                     : links[0];
 
                 match?.click();
@@ -2672,6 +2941,119 @@ async function extractWirelessPhoneCandidates(page) {
     });
 }
 
+// Fallback extractor: collect EVERY phone-shaped number on the detail page
+// regardless of label (wireless / voip / landline / unlabeled), preserving
+// page order so callers can take the FIRST available number when no wireless
+// number exists. Formatting/normalization matches extractWirelessPhoneCandidates.
+async function extractAnyPhoneCandidates(page) {
+    await page
+        .waitForFunction(
+            () =>
+                /(?:\+?1[\s.\-]?)?\(?[2-9]\d{2}\)?[\s.\-]\d{3}[\s.\-]\d{4}/.test(
+                    document.body.innerText || "",
+                ),
+            { timeout: 5_000 },
+        )
+        .catch(() => {});
+
+    const candidates = await page.evaluate(() => {
+        const clean = (value) =>
+            String(value || "").replace(/\s+/g, " ").trim();
+
+        const phonePattern =
+            /(?:\+?1[\s.\-]?)?\(?[2-9]\d{2}\)?[\s.\-]\d{3}[\s.\-]\d{4}/g;
+
+        const wirelessLabelPattern =
+            /\b(wireless|mobile|cellular|cell phone)\b/i;
+        const landlineLabelPattern = /\blandline\b/i;
+        const voipLabelPattern = /\bvoip\b/i;
+
+        const reportedPattern =
+            /last\s+reported\s+[A-Za-z]{3,9}\s+\d{4}/i;
+
+        const output = [];
+        const bodyText = document.body.innerText || "";
+
+        const matches = [];
+        phonePattern.lastIndex = 0;
+        let m;
+        while ((m = phonePattern.exec(bodyText)) !== null) {
+            matches.push({
+                phone: m[0],
+                start: m.index,
+                end: m.index + m[0].length,
+            });
+        }
+
+        const MAX_LABEL_WINDOW = 22;
+
+        for (let i = 0; i < matches.length; i += 1) {
+            const { phone, start, end } = matches[i];
+
+            const nextStart =
+                i + 1 < matches.length
+                    ? matches[i + 1].start
+                    : bodyText.length;
+
+            const labelWindow = bodyText.slice(
+                end,
+                Math.min(nextStart, end + MAX_LABEL_WINDOW),
+            );
+
+            let type = "unknown";
+            if (wirelessLabelPattern.test(labelWindow)) {
+                type = "wireless";
+            } else if (voipLabelPattern.test(labelWindow)) {
+                type = "voip";
+            } else if (landlineLabelPattern.test(labelWindow)) {
+                type = "landline";
+            }
+
+            const winStart = Math.max(0, start - 60);
+            const winEnd = Math.min(bodyText.length, end + 120);
+            const context = clean(bodyText.slice(winStart, winEnd));
+
+            output.push({
+                phone,
+                type,
+                context,
+                lastReported:
+                    context.match(reportedPattern)?.[0] || null,
+            });
+        }
+
+        return output;
+    });
+
+    const unique = new Map();
+
+    for (const candidate of candidates) {
+        const normalized = normalizePhone(candidate.phone);
+
+        if (!normalized) {
+            continue;
+        }
+
+        // Keep first occurrence (page order) so the caller's "first available"
+        // fallback is deterministic and matches what a human reads top-down.
+        if (unique.has(normalized)) {
+            continue;
+        }
+
+        unique.set(normalized, {
+            phone: normalized,
+            type: candidate.type,
+            context: cleanText(candidate.context),
+            lastReported: candidate.lastReported || null,
+            reportedAt: parseReportedDate(
+                candidate.lastReported || candidate.context,
+            ),
+        });
+    }
+
+    return [...unique.values()];
+}
+
 // When a search returns 0 detail-link cards, dump a short page snapshot
 // so we can tell whether FTN genuinely had no match, returned a different
 // layout, or is silently showing an inline captcha.
@@ -2689,8 +3071,8 @@ async function logZeroResultsDiagnostics(page, person) {
 
                 const widgetPresent = !!document.querySelector(
                     ".cf-turnstile, [data-sitekey], " +
-                        'iframe[src*="challenges.cloudflare.com"], ' +
-                        '[name="cf-turnstile-response"]',
+                    'iframe[src*="challenges.cloudflare.com"], ' +
+                    '[name="cf-turnstile-response"]',
                 );
 
                 return {
@@ -2711,17 +3093,17 @@ async function logZeroResultsDiagnostics(page, person) {
 
         console.log(
             `🔎 [diag] ${person.fullName} returned 0 results ` +
-                `— url: ${info.url}`,
+            `— url: ${info.url}`,
         );
         console.log(
             `   turnstile widget present: ${info.widgetPresent} | ` +
-                `"no results" text: ${info.noResults}`,
+            `"no results" text: ${info.noResults}`,
         );
         console.log(`   page snippet: ${info.snippet}`);
     } catch (error) {
         console.log(
             `🔎 [diag] results-page scan failed ` +
-                `(${error?.message || error}).`,
+            `(${error?.message || error}).`,
         );
     }
 }
@@ -2788,9 +3170,9 @@ async function logNoPhoneDiagnostics(page, person) {
 
         console.log(
             `🔎 [diag] ${person.fullName} detail page phone scan — ` +
-                `wireless label: ${info.hasWirelessLabel} | ` +
-                `landline label: ${info.hasLandlineLabel} | ` +
-                `numbers found: ${info.found.length}`,
+            `wireless label: ${info.hasWirelessLabel} | ` +
+            `landline label: ${info.hasLandlineLabel} | ` +
+            `numbers found: ${info.found.length}`,
         );
 
         for (const entry of info.found) {
@@ -2801,7 +3183,7 @@ async function logNoPhoneDiagnostics(page, person) {
     } catch (error) {
         console.log(
             `🔎 [diag] detail-page scan failed ` +
-                `(${error?.message || error}).`,
+            `(${error?.message || error}).`,
         );
     }
 }
@@ -2914,6 +3296,11 @@ async function enrichOneRow(page, row) {
     const maxAttempts = Math.min(candidates.length, MAX_PHONE_ATTEMPTS);
     let openedAny = false;
 
+    // Wireless is preferred, but if no candidate yields a wireless number we
+    // fall back to the FIRST available number of any type (voip/landline)
+    // seen across attempts. Remember the earliest such number here.
+    let fallbackChoice = null;
+
     for (let i = 0; i < maxAttempts; i += 1) {
         const candidate = candidates[i];
         const attemptNum = i + 1;
@@ -2955,23 +3342,8 @@ async function enrichOneRow(page, row) {
         if (wirelessPhones.length) {
             const best = wirelessPhones[0];
 
-            const updated = await updateMobilePhone(
-                row.id,
-                best.phone,
-            );
-
-            if (!updated) {
-                console.log(
-                    `ℹ️ ID ${row.id} already had a mobile phone by update time.`,
-                );
-
-                return {
-                    status: "already_updated",
-                };
-            }
-
             console.log(
-                `✅ ID ${row.id}: saved mobile_phone ${best.phone}` +
+                `✅ ID ${row.id}: found wireless phone ${best.phone}` +
                 `${best.lastReported ? ` (${best.lastReported})` : ""}` +
                 `${attemptNum > 1 ? ` (result ${attemptNum})` : ""}`,
             );
@@ -2979,6 +3351,9 @@ async function enrichOneRow(page, row) {
             return {
                 status: "updated",
                 phone: best.phone,
+                personName: candidate.resultName || person.fullName,
+                searchCity,
+                address: null,
             };
         }
 
@@ -2989,6 +3364,20 @@ async function enrichOneRow(page, row) {
         );
 
         await logNoPhoneDiagnostics(page, person);
+
+        // No wireless on this page — capture the first available number of any
+        // type as a fallback (only the earliest one across attempts is kept).
+        if (!fallbackChoice) {
+            const anyPhones = await extractAnyPhoneCandidates(page);
+
+            if (anyPhones.length) {
+                fallbackChoice = {
+                    ...anyPhones[0],
+                    attemptNum,
+                    personName: candidate.resultName || person.fullName,
+                };
+            }
+        }
     }
 
     if (!openedAny) {
@@ -2996,6 +3385,25 @@ async function enrichOneRow(page, row) {
         // captcha/vignette. Mark failed so the row gets retried.
         return {
             status: "failed",
+        };
+    }
+
+    // No wireless number anywhere — fall back to the first available number
+    // of any type (voip/landline) so the row is still enriched.
+    if (fallbackChoice) {
+        console.log(
+            `✅ ID ${row.id}: found phone ${fallbackChoice.phone}` +
+            ` (${fallbackChoice.type})` +
+            `${fallbackChoice.lastReported ? ` (${fallbackChoice.lastReported})` : ""}` +
+            `${fallbackChoice.attemptNum > 1 ? ` (result ${fallbackChoice.attemptNum})` : ""}`,
+        );
+
+        return {
+            status: "updated",
+            phone: fallbackChoice.phone,
+            personName: fallbackChoice.personName || person.fullName,
+            searchCity,
+            address: null,
         };
     }
 
@@ -3170,6 +3578,60 @@ async function runEnrichmentLoop(page, rows, workerIndex) {
             totals[result.status] =
                 (totals[result.status] || 0) + 1;
 
+            // Phase 2: persist the outcome. On success, the familytreenow INSERT
+            // must succeed BEFORE the lead is marked 'enriched' — if the insert
+            // throws we leave the lead unmarked so it retries (never a stray
+            // 'enriched' mark without a captured row). Terminal no-op outcomes
+            // are marked so they are not re-picked. Only true infrastructure
+            // failures (result.status === "failed") stay unmarked for retry.
+            try {
+                if (result.status === "updated") {
+                    const routed = await routeContractors(
+                        row.lead_type,
+                        result.searchCity,
+                        row.state,
+                    );
+
+                    // INSERT first; only mark 'enriched' if it did not throw.
+                    await insertFamilyTreeNowRow({
+                        author: result.personName || row.author,
+                        city: result.searchCity,
+                        state: cleanText(row.state).toUpperCase(),
+                        address: result.address ?? null,
+                        phone: result.phone,
+                        companyNames: routed.companyNames,
+                        phones: routed.phones,
+                        leadType: row.lead_type,
+                    });
+
+                    await markLeadProcessed(row.id, "enriched");
+
+                    console.log(
+                        `🗂️ ID ${row.id}: familytreenow row inserted ` +
+                        `(${routed.phones.length} contractor(s) routed).`,
+                    );
+                } else if (result.status === "no_matching_result") {
+                    await markLeadProcessed(row.id, "no_match");
+                } else if (result.status === "no_mobile_phone") {
+                    await markLeadProcessed(row.id, "no_phone");
+                } else if (result.status === "invalid_name") {
+                    // Unusable name for a lookup; mark so it is not re-picked.
+                    await markLeadProcessed(row.id, "invalid_name");
+                } else if (
+                    result.status === "invalid_location" ||
+                    result.status === "location_not_selected"
+                ) {
+                    // Location can't be resolved (bad city/state, or FTN
+                    // autocomplete / LOCATION_OVERRIDES couldn't select it).
+                    // Terminal — mark so it is not re-picked forever.
+                    await markLeadProcessed(row.id, "invalid_location");
+                }
+            } catch (dbError) {
+                console.error(
+                    `❌ ID ${row.id}: DB persist failed: ${dbError.message}`,
+                );
+            }
+
             // Phase 2: running success count to console (how many of how many
             // succeeded so far for this worker). The grand total across all
             // workers is logged by the master at the end (printGrandTotals).
@@ -3312,7 +3774,7 @@ async function runMaster() {
     const rows = await getRowsToEnrich();
 
     console.log(
-        `📋 Loaded ${rows.length} row(s) with no mobile_phone.`,
+        `📋 Loaded ${rows.length} unprocessed lead(s) to enrich.`,
     );
 
     if (!rows.length) {
