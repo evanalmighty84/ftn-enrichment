@@ -373,6 +373,7 @@ async function getRowsToEnrich() {
             SELECT
                 id,
                 author,
+                description,
                 city,
                 state,
                 lead_type
@@ -628,6 +629,8 @@ async function routeContractors(leadType, resolvedCity, state) {
 // familytreenow. Only called when a phone was found. company_name and
 // professionalnumbertocall are text[]; pg maps JS arrays directly.
 async function insertFamilyTreeNowRow({
+                                          leadId,
+                                          description,
                                           author,
                                           city,
                                           state,
@@ -640,12 +643,14 @@ async function insertFamilyTreeNowRow({
     await pool.query(
         `
             INSERT INTO familytreenow
-                (author, city, state, address, phone, email,
-                 company_name, professionalnumbertocall,
-                 lead_type, scraped_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now())
+            (lead_id, description, author, city, state, address, phone,
+             email, company_name, professionalnumbertocall,
+             lead_type, scraped_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
         `,
         [
+            leadId ?? null,
+            description ?? null,
             author,
             city,
             state,
@@ -2100,8 +2105,8 @@ async function getFamilyTreeNowResults(page, person, city, state) {
             (expectedState
                 ? new RegExp(
                     `\b${escapeRegex(
-                        expectedState.toLowerCase(),
-                    )}\b`,
+                          expectedState.toLowerCase(),
+                      )}\b`,
                 ).test(livedInNormalized)
                 : true);
 
@@ -3594,6 +3599,8 @@ async function runEnrichmentLoop(page, rows, workerIndex) {
 
                     // INSERT first; only mark 'enriched' if it did not throw.
                     await insertFamilyTreeNowRow({
+                        leadId: row.id,
+                        description: row.description,
                         author: result.personName || row.author,
                         city: result.searchCity,
                         state: cleanText(row.state).toUpperCase(),
