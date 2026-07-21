@@ -1,18 +1,19 @@
 {
-  "name": "railway-multilogin-nextdoor-lights",
+  "name": "ftn-enrichment-phase2",
   "version": "1.0.0",
   "private": true,
-  "description": "Railway cron runner for Multilogin + Playwright Nextdoor lights collection",
-  "main": "checkCoreDownload.js",
+  "description": "Phase 2: FTN phone enrichment on Railway via Smartproxy + Chrome + 2captcha.",
+  "type": "commonjs",
+  "main": "ftn_enrichment.js",
   "scripts": {
-    "start": "node checkCoreDownload.js",
-    "scrape": "node nextdoor_unfiltered_general_contracting.js",
-    "check": "node checkCoreDownload.js"
+    "start": "node ftn_enrichment.js"
   },
-  "engines": { "node": ">=20" },
   "dependencies": {
-    "dotenv": "^16.4.7",
-    "pg": "^8.13.1",
-    "playwright-core": "^1.53.0"
+    "dotenv": "^16.4.5",
+    "pg": "^8.11.3",
+    "playwright-core": "^1.48.0"
+  },
+  "engines": {
+    "node": "20.x"
   }
 }
