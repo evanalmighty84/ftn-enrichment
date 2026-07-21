@@ -1,0 +1,3474 @@
+#!/usr/bin/env node
+
+"use strict";
+
+require("dotenv").config();
+
+// ---------------------------------------------------------------------------
+// Phase 2 — Railway adaptation of the proven FTN phone-enrichment script.
+//
+// The repo's db/db.js exposes a `pg` Pool built from DB_* env vars with
+// `ssl: { rejectUnauthorized: false }`. That file is not shipped here, so the
+// pool is constructed inline below from the same DB_* env vars (or DATABASE_URL)
+// using exactly that configuration. All FTN lookup logic (Smartproxy, 2captcha,
+// playwright-core, selection tiers, wireless-only extractor) is preserved
+// verbatim from the proven script — only the DB selection query and Railway
+// connectivity were adapted.
+//
+// Selection (Phase 2): rows WHERE is_lead = true AND mobile_phone IS NULL,
+// ordered newest-first (id DESC). Sonar (Phase 1) already set is_lead /
+// enrichment / enrichment_status='lead' on these rows.
+// ---------------------------------------------------------------------------
+
+const fs = require("fs");
+const path = require("path");
+const os = require("os");
+const { fork } = require("child_process");
+const { chromium } = require("playwright-core");
+const { Pool } = require("pg");
+
+// Build the pg Pool the same way the repo's db/db.js does: prefer an explicit
+// DATABASE_URL when present, otherwise compose one from DB_* vars. SSL is
+// enabled with rejectUnauthorized:false so connections to managed Postgres
+// (e.g. Railway, Render) whose root CA is not in the container's trust store
+// still succeed — matching the repo's established behavior.
+function buildPool() {
+    const connectionString =
+        process.env.DATABASE_URL ||
+        (process.env.DB_USER && process.env.DB_HOST && process.env.DB_NAME
+            ? `postgres://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(
+                  process.env.DB_PASSWORD || "",
+              )}@${process.env.DB_HOST}:${process.env.DB_PORT || 5432}/${encodeURIComponent(
+                  process.env.DB_NAME,
+              )}`
+            : null);
+
+    if (!connectionString) {
+        throw new Error(
+            "No Postgres connection configured. Set DATABASE_URL or " +
+                "DB_USER/DB_HOST/DB_NAME/DB_PASSWORD/DB_PORT.",
+        );
+    }
+
+    return new Pool({
+        connectionString,
+        ssl: { rejectUnauthorized: false },
+    });
+}
+
+const pool = buildPool();
+
+const TABLE_NAME = "unfiltered_general_contracting";
+const FTN_HOME_URL = "https://www.familytreenow.com/";
+
+const MAX_ROWS = Number(process.env.FTN_MAX_ROWS || 50);
+const MIN_DELAY_MS = Number(process.env.FTN_MIN_DELAY_MS || 2500);
+const MAX_DELAY_MS = Number(process.env.FTN_MAX_DELAY_MS || 4500);
+
+// ---- 2captcha Cloudflare Turnstile solver config ----
+// Set TWO_CAPTCHA_API_KEY in your .env (or exports) to enable solving.
+// Requires Node 18+ (global fetch) or `npm i node-fetch`.
+const TWO_CAPTCHA_API = "https://api.2captcha.com";
+const TWO_CAPTCHA_KEY = process.env.TWO_CAPTCHA_API_KEY || "";
+const MAX_CAPTCHA_ATTEMPTS = Number(
+    process.env.FTN_MAX_CAPTCHA_ATTEMPTS || 3,
+);
+const CAPTCHA_POLL_INTERVAL_MS = 5_000;
+const CAPTCHA_POLL_TIMEOUT_MS = 180_000;
+
+// How long to let the page settle after submitting the search form or
+// after the captcha passes (both are navigations). Stops the script
+// from charging into the next step before FTN has rendered the result.
+const POST_NAV_SETTLE_MS = Number(
+    process.env.FTN_POST_NAV_SETTLE_MS || 4_000,
+);
+
+// Max number of qualifying results to open per row when hunting for a mobile
+// phone. If the first exact match has no wireless number, the script tries
+// the next qualifying result, up to this cap (then gives up).
+// Accept both FTN_MAX_PHONE_ATTEMPTS (proven) and the bare MAX_PHONE_ATTEMPTS
+// documented in the Phase 2 README. FTN_ prefix wins when both are set.
+const MAX_PHONE_ATTEMPTS = Number(
+    process.env.FTN_MAX_PHONE_ATTEMPTS || process.env.MAX_PHONE_ATTEMPTS || 5,
+);
+
+// ---- Smartproxy / multi-worker config ----
+// Mirrors your workerb.js setup: one proxy IP per worker.
+// Override with FTN_PROXIES (comma-separated) in .env.
+const PROXY_POOL = (process.env.FTN_PROXIES ||
+    "207.228.202.97,207.228.200.57,107.158.19.135")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+const PROXY_PORT = Number(process.env.FTN_PROXY_PORT || 6014);
+// Accept both the FTN_-prefixed names (existing/proven) and the bare
+// PROXY_USER / PROXY_PASS names documented in the Phase 2 README. The FTN_
+// prefix wins when both are set so existing behavior is preserved.
+const PROXY_USER =
+    process.env.FTN_PROXY_USER || process.env.PROXY_USER || "smart-kig91nd2ixd4";
+const PROXY_PASS =
+    process.env.FTN_PROXY_PASS || process.env.PROXY_PASS || "viWjWbPWNUVgWG0b";
+const WORKER_COUNT = Number(
+    process.env.FTN_WORKER_COUNT || Math.min(PROXY_POOL.length, 3) || 1,
+);
+const WARM_UP_ENABLED = String(process.env.FTN_WARM_UP || "1") !== "0";
+const BROWSER_MODE = (
+    process.env.FTN_BROWSER_MODE || "smartproxy"
+).toLowerCase();
+
+// ---- Subdivision / neighborhood → real-city overrides ----
+// The DB `city` column sometimes holds a subdivision or neighborhood name
+// (e.g. "Stonebriar Village") that FamilyTreeNow's city autocomplete can't
+// resolve, so the row is skipped before searching. This map rewrites those
+// to their real parent city BEFORE the autocomplete step, so the search runs.
+//
+// ⚠️ VERIFY these mappings before relying on them — a wrong guess just causes
+// a no-match skip (safe, no wrong phones), but a correct one rescues the row.
+// Keys are matched case-insensitively against the cleaned DB city. Add more
+// as you confirm them.
+const LOCATION_OVERRIDES = {
+    "stonebriar village": "Frisco",
+    "timberbend": "Frisco",
+    "villages of preston glen": "Plano",
+    "waterford trails": "Frisco",
+    "villas of el dorado": "Allen",
+    // "pine ridge estates": "",
+    // "plantation estates": "",
+    // "cottonwood bend": "",
+    // "bloomdale estates": "",
+    // "park place": "",
+    // "eagle's nest": "",
+    // "fitzhugh st": "",
+    // "bilirany road/squeezepenny": "",
+};
+
+// Injected before any page scripts run so we can intercept the
+// turnstile.render call. Captures sitekey + the success callback (and,
+// when present, the challenge-page fields action / cData / chlPageData)
+// so the same code path handles both standalone widgets and challenge pages.
+const TURNSTILE_INIT_SCRIPT = `
+(() => {
+  const grab = (b) => {
+    try {
+      window.__tsInfo = {
+        websiteKey: b && b.sitekey,
+        websiteURL: window.location.href,
+        action: b && b.action,
+        data: b && b.cData,
+        pagedata: b && b.chlPageData,
+        userAgent: navigator.userAgent,
+      };
+      window.__tsCallback = b && typeof b.callback === "function" ? b.callback : null;
+    } catch (e) {}
+  };
+  const i = setInterval(() => {
+    if (window.turnstile) {
+      clearInterval(i);
+      const original = window.turnstile.render;
+      window.turnstile.render = function (a, b) {
+        grab(b || {});
+        return original ? original.apply(this, arguments) : "foo";
+      };
+    }
+  }, 10);
+})();
+`;
+
+const sleep = (ms) =>
+    new Promise((resolve) => {
+        setTimeout(resolve, ms);
+    });
+
+// Wait for the page to settle after a navigation (search submit, captcha
+// pass). Waits for the DOM to be ready, then for network to quiet down
+// (best-effort — FTN keeps some long-poll/analytics connections alive),
+// then a fixed settle pause so content has time to render.
+async function waitForPageSettled(page, timeoutMs = 15_000) {
+    await page
+        .waitForLoadState("domcontentloaded", { timeout: timeoutMs })
+        .catch(() => {});
+    await page
+        .waitForLoadState("networkidle", { timeout: 8_000 })
+        .catch(() => {});
+    await sleep(POST_NAV_SETTLE_MS);
+}
+
+function cleanText(value = "") {
+    return String(value).replace(/\s+/g, " ").trim();
+}
+
+// Title-case a name for searching: capitalize the first letter and any letter
+// following a space, apostrophe, or hyphen, while preserving other capitals.
+// Ensures "O'bier" / "o'bier" from the DB is searched as "O'Bier", and
+// "partlow-shelton" as "Partlow-Shelton". Does NOT force-lowercase interior
+// letters, so "McDonald" / "DeLuca" keep their existing capitals.
+function capitalizeName(value = "") {
+    const s = cleanText(value);
+    if (!s) return s;
+    return s.replace(
+        /(^|[\s'\-])([a-z])/g,
+        (_match, prefix, ch) => prefix + ch.toUpperCase(),
+    );
+}
+
+// Strip trailing generational suffixes (Jr, Sr, II, III, IV, V, VI, 2nd, 3rd)
+// and punctuation so "Mike Downs Jr" matches a search for "Mike Downs". This
+// only loosens the comparison within the same base name — it never merges
+// genuinely different names (e.g. Christa vs Kristina Roth).
+const NAME_SUFFIX_RE =
+    /\s+(?:jr|sr|ii|iii|iv|v|vi|vii|viii|ix|x|2nd|3rd|4th)\.?$/gi;
+
+function normalizeNameForComparison(value = "") {
+    return cleanText(value)
+        .replace(NAME_SUFFIX_RE, " ")
+        .replace(/[^a-z0-9\s]/gi, " ")
+        .replace(/\s+/g, " ")
+        .trim()
+        .toLowerCase();
+}
+
+// Split a name into lowercased segments (first, middle, last, ...) after
+// suffix/punctuation normalization. Hyphens become segment boundaries too.
+function nameSegments(value = "") {
+    return normalizeNameForComparison(value)
+        .split(/[\s-]+/)
+        .filter(Boolean);
+}
+
+function firstNameSegment(value = "") {
+    const segs = nameSegments(value);
+    return segs.length ? segs[0] : "";
+}
+
+function lastNameSegment(value = "") {
+    const segs = nameSegments(value);
+    return segs.length ? segs[segs.length - 1] : "";
+}
+
+function escapeRegex(value = "") {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function randomDelay() {
+    const min = Math.min(MIN_DELAY_MS, MAX_DELAY_MS);
+    const max = Math.max(MIN_DELAY_MS, MAX_DELAY_MS);
+
+    return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+/**
+ * Accept only an unmistakable two-word personal name.
+ *
+ * Accepted examples:
+ *   Andrew Davis
+ *   Willy Mac-Ossi
+ *   Evan Partlow-Shelton
+ *   Rachel O’Bier
+ *
+ * Rejected examples:
+ *   Angela and Brian S.
+ *   Marisol And Israel Garza
+ *   Leah R.
+ *   Patrick S.
+ */
+function parseStrictTwoWordName(author = "") {
+    const clean = cleanText(author).normalize("NFC");
+    const parts = clean.split(" ");
+
+    if (parts.length !== 2) {
+        return null;
+    }
+
+    const [firstName, lastName] = parts;
+
+    const validNamePart =
+        /^\p{L}[\p{L}'’\-]*$/u;
+
+    if (
+        !validNamePart.test(firstName) ||
+        !validNamePart.test(lastName)
+    ) {
+        return null;
+    }
+
+    const firstLetterCount =
+        firstName.match(/\p{L}/gu)?.length || 0;
+
+    const lastLetterCount =
+        lastName.match(/\p{L}/gu)?.length || 0;
+
+    if (firstLetterCount < 2 || lastLetterCount < 4) {
+        return null;
+    }
+
+    const capFirst = capitalizeName(firstName);
+    const capLastFull = capitalizeName(lastName);
+
+    // For hyphenated last names, search using only the final segment (e.g.
+    // "Partlow-Shelton" -> "Shelton") so FTN's name search/autocomplete
+    // matches reliably. The full name is retained on `fullName` for result
+    // matching and logging.
+    const searchLastName = capLastFull.includes("-")
+        ? capitalizeName(lastName.split("-").pop())
+        : capLastFull;
+
+    return {
+        firstName: capFirst,
+        lastName: searchLastName,
+        fullName: `${capFirst} ${capLastFull}`,
+    };
+}
+
+function normalizePhone(phone = "") {
+    const digits = String(phone).replace(/\D/g, "");
+    const tenDigits =
+        digits.length === 11 && digits.startsWith("1")
+            ? digits.slice(1)
+            : digits;
+
+    if (!/^[2-9]\d{9}$/.test(tenDigits)) {
+        return null;
+    }
+
+    return `(${tenDigits.slice(0, 3)}) ` +
+        `${tenDigits.slice(3, 6)}-` +
+        `${tenDigits.slice(6)}`;
+}
+
+function parseReportedDate(text = "") {
+    const match = cleanText(text).match(
+        /last\s+reported\s+([A-Za-z]{3,9})\s+(\d{4})/i,
+    );
+
+    if (!match) {
+        return null;
+    }
+
+    const parsed = Date.parse(`${match[1]} 1, ${match[2]}`);
+
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+async function getRowsToEnrich() {
+    // Phase 2: target only Sonar-confirmed leads that still lack a mobile
+    // phone. is_lead is set by Phase 1 (Sonar); mobile_phone IS NULL means
+    // FTN has not yet enriched the row. Newest rows first (id DESC) so fresh
+    // leads are prioritized. author/city/state must be present for a lookup.
+    const { rows } = await pool.query(
+        `
+            SELECT
+                id,
+                author,
+                city,
+                state
+            FROM ${TABLE_NAME}
+            WHERE is_lead = true
+              AND mobile_phone IS NULL
+              AND author IS NOT NULL
+              AND city IS NOT NULL
+              AND state IS NOT NULL
+            ORDER BY id DESC
+                LIMIT $1
+        `,
+        [MAX_ROWS],
+    );
+
+    return rows;
+}
+
+async function updateMobilePhone(id, phone) {
+    const { rowCount } = await pool.query(
+        `
+            UPDATE ${TABLE_NAME}
+            SET mobile_phone = $1
+            WHERE id = $2
+              AND mobile_phone IS NULL
+        `,
+        [phone, id],
+    );
+
+    return rowCount > 0;
+}
+
+async function findVisibleInput(page, selectors) {
+    for (const selector of selectors) {
+        const candidate = page.locator(selector).first();
+
+        if (
+            (await candidate.count().catch(() => 0)) &&
+            (await candidate.isVisible().catch(() => false))
+        ) {
+            return candidate;
+        }
+    }
+
+    return null;
+}
+
+async function openFamilyTreeNow(page) {
+    await page.goto(FTN_HOME_URL, {
+        waitUntil: "domcontentloaded",
+        timeout: 60_000,
+    });
+
+    await sleep(2_000);
+
+    // FamilyTreeNow may redirect to /InternalCaptcha (a standalone
+    // Cloudflare Turnstile widget). Solve it inline instead of aborting.
+    await ensureCaptchaSolved(page);
+}
+
+async function findSearchForm(page) {
+    const firstNameInput = await findVisibleInput(page, [
+        'input[placeholder="First name"]',
+        'input[placeholder*="First name" i]',
+        'input[name*="first" i]',
+        'input[id*="first" i]',
+    ]);
+
+    const lastNameInput = await findVisibleInput(page, [
+        'input[placeholder="Last name"]',
+        'input[placeholder*="Last name" i]',
+        'input[name*="last" i]',
+        'input[id*="last" i]',
+    ]);
+
+    const cityStateInput = await findVisibleInput(page, [
+        'input[placeholder*="City, state" i]',
+        'input[placeholder*="City" i]',
+        'input[name*="location" i]',
+        'input[name*="city" i]',
+        'input[id*="location" i]',
+        'input[id*="city" i]',
+    ]);
+
+    if (!firstNameInput || !lastNameInput || !cityStateInput) {
+        throw new Error(
+            "Could not find all three FamilyTreeNow search fields.",
+        );
+    }
+
+    return {
+        firstNameInput,
+        lastNameInput,
+        cityStateInput,
+    };
+}
+
+/**
+ * The city/state field must be selected from FamilyTreeNow's
+ * autocomplete list. The search is skipped when an exact suggestion
+ * cannot be found.
+ */
+async function getVisibleAutocompleteTexts(page) {
+    const selectors = [
+        '[role="option"]',
+        '[role="listbox"] li',
+        ".ui-autocomplete li",
+        ".autocomplete li",
+        '[class*="autocomplete"] li',
+        '[class*="suggest"] li',
+        '[class*="typeahead"] li',
+        '[data-testid*="suggest"]',
+    ].join(",");
+
+    return page
+        .locator(selectors)
+        .evaluateAll((elements) => {
+            return elements
+                .filter((element) => {
+                    const style = window.getComputedStyle(element);
+                    const box = element.getBoundingClientRect();
+
+                    return (
+                        style.display !== "none" &&
+                        style.visibility !== "hidden" &&
+                        box.width > 0 &&
+                        box.height > 0
+                    );
+                })
+                .map((element) =>
+                    (element.innerText || element.textContent || "")
+                        .replace(/\s+/g, " ")
+                        .trim(),
+                )
+                .filter(Boolean)
+                .slice(0, 25);
+        })
+        .catch(() => []);
+}
+
+async function findExactLocationSuggestion(
+    page,
+    cityStateInput,
+    targetRegex,
+) {
+    const inputBox = await cityStateInput.boundingBox();
+
+    const selectorGroups = [
+        '[role="option"]',
+        '[role="listbox"] li',
+        ".ui-autocomplete li",
+        ".autocomplete li",
+        '[class*="autocomplete"] li',
+        '[class*="autocomplete"] div',
+        '[class*="suggest"] li',
+        '[class*="suggest"] div',
+        '[class*="typeahead"] li',
+        '[class*="typeahead"] div',
+        '[data-testid*="suggest"]',
+    ];
+
+    for (const selector of selectorGroups) {
+        const candidates = page.locator(selector);
+        const count = Math.min(
+            await candidates.count().catch(() => 0),
+            60,
+        );
+
+        for (let index = 0; index < count; index += 1) {
+            const candidate = candidates.nth(index);
+
+            if (!(await candidate.isVisible().catch(() => false))) {
+                continue;
+            }
+
+            const text = cleanText(
+                await candidate.innerText().catch(() => ""),
+            );
+
+            if (!targetRegex.test(text)) {
+                continue;
+            }
+
+            const candidateBox =
+                await candidate.boundingBox().catch(() => null);
+
+            if (
+                inputBox &&
+                candidateBox &&
+                (
+                    candidateBox.y < inputBox.y - 10 ||
+                    candidateBox.y > inputBox.y + 500
+                )
+            ) {
+                continue;
+            }
+
+            return candidate;
+        }
+    }
+
+    // FamilyTreeNow sometimes renders the suggestions as plain nested
+    // divs instead of role=option/list items. Search exact visible text
+    // and prefer the match positioned below the City, State input.
+    const exactMatches = page.getByText(targetRegex, {
+        exact: true,
+    });
+
+    const count = Math.min(
+        await exactMatches.count().catch(() => 0),
+        50,
+    );
+
+    let fallback = null;
+
+    for (let index = count - 1; index >= 0; index -= 1) {
+        const candidate = exactMatches.nth(index);
+
+        if (!(await candidate.isVisible().catch(() => false))) {
+            continue;
+        }
+
+        const candidateBox =
+            await candidate.boundingBox().catch(() => null);
+
+        if (!candidateBox) {
+            continue;
+        }
+
+        if (!fallback) {
+            fallback = candidate;
+        }
+
+        if (!inputBox) {
+            return candidate;
+        }
+
+        const inputBottom = inputBox.y + inputBox.height;
+        const horizontalOverlap =
+            candidateBox.x < inputBox.x + inputBox.width + 160 &&
+            candidateBox.x + candidateBox.width > inputBox.x - 160;
+
+        const belowInput =
+            candidateBox.y >= inputBottom - 15 &&
+            candidateBox.y <= inputBottom + 450;
+
+        if (horizontalOverlap && belowInput) {
+            return candidate;
+        }
+    }
+
+    return fallback;
+}
+
+async function selectActiveExactLocation(
+    page,
+    cityStateInput,
+    targetRegex,
+) {
+    await cityStateInput.focus();
+
+    for (let index = 0; index < 15; index += 1) {
+        await page.keyboard.press("ArrowDown");
+        await sleep(120);
+
+        const activeText = await page.evaluate(() => {
+            const input = document.activeElement;
+            const activeId =
+                input?.getAttribute?.("aria-activedescendant");
+
+            if (activeId) {
+                const active = document.getElementById(activeId);
+
+                if (active) {
+                    return (
+                        active.innerText ||
+                        active.textContent ||
+                        ""
+                    )
+                        .replace(/\s+/g, " ")
+                        .trim();
+                }
+            }
+
+            const activeOption = document.querySelector(
+                '[role="option"][aria-selected="true"], ' +
+                ".ui-state-active, " +
+                ".autocomplete-active, " +
+                '[class*="suggest"] .active',
+            );
+
+            return (
+                activeOption?.innerText ||
+                activeOption?.textContent ||
+                ""
+            )
+                .replace(/\s+/g, " ")
+                .trim();
+        });
+
+        if (activeText && targetRegex.test(activeText)) {
+            await page.keyboard.press("Enter");
+            await sleep(600);
+            return true;
+        }
+    }
+
+    await page.keyboard.press("Escape").catch(() => {});
+    return false;
+}
+
+/**
+ * The city/state field must be selected from FamilyTreeNow's
+ * autocomplete list. It types only enough of the city to make the
+ * dropdown appear, then clicks the exact "City, ST" suggestion.
+ */
+async function chooseExactCityStateSuggestion(
+    page,
+    cityStateInput,
+    city,
+    state,
+) {
+    const cleanCity = cleanText(city);
+    const cleanState = cleanText(state).toUpperCase();
+    const target = `${cleanCity}, ${cleanState}`;
+
+    const targetRegex = new RegExp(
+        `^${escapeRegex(cleanCity)}\\s*,\\s*` +
+        `${escapeRegex(cleanState)}$`,
+        "i",
+    );
+
+    const lettersOnlyCity = cleanCity.replace(
+        /[^\p{L}\s.'’\-]/gu,
+        "",
+    );
+
+    const attempts = Array.from(
+        new Set([
+            lettersOnlyCity.slice(0, 3),
+            lettersOnlyCity.slice(0, 5),
+            lettersOnlyCity,
+            `${lettersOnlyCity},`,
+        ].filter((value) => value.length >= 2)),
+    );
+
+    // Close any First Name autocomplete that is still open.
+    await page.keyboard.press("Escape").catch(() => {});
+
+    for (const typedValue of attempts) {
+        console.log(
+            `⌨️ City autocomplete attempt: "${typedValue}"`,
+        );
+
+        await cityStateInput.click();
+        await cityStateInput.fill("");
+        await cityStateInput.type(typedValue, {
+            delay: 140,
+        });
+
+        const deadline = Date.now() + 5_000;
+
+        while (Date.now() < deadline) {
+            const suggestion =
+                await findExactLocationSuggestion(
+                    page,
+                    cityStateInput,
+                    targetRegex,
+                );
+
+            if (suggestion) {
+                await suggestion.click();
+                await sleep(700);
+
+                const selectedValue = cleanText(
+                    await cityStateInput
+                        .inputValue()
+                        .catch(() => ""),
+                );
+
+                if (targetRegex.test(selectedValue)) {
+                    console.log(
+                        `✅ Selected autocomplete location: ${target}`,
+                    );
+                    return true;
+                }
+
+                console.log(
+                    `ℹ️ Clicked the exact suggestion; field now reads ` +
+                    `"${selectedValue}".`,
+                );
+
+                // A click on the exact visible suggestion counts as an
+                // autocomplete selection even when the site normalizes
+                // spacing/capitalization in the input.
+                if (
+                    selectedValue &&
+                    selectedValue.toLowerCase() ===
+                    target.toLowerCase()
+                ) {
+                    return true;
+                }
+            }
+
+            await sleep(350);
+        }
+
+        const selectedWithKeyboard =
+            await selectActiveExactLocation(
+                page,
+                cityStateInput,
+                targetRegex,
+            );
+
+        if (selectedWithKeyboard) {
+            const selectedValue = cleanText(
+                await cityStateInput
+                    .inputValue()
+                    .catch(() => ""),
+            );
+
+            if (targetRegex.test(selectedValue)) {
+                console.log(
+                    `✅ Selected autocomplete location with keyboard: ` +
+                    `${target}`,
+                );
+                return true;
+            }
+        }
+
+        const visibleSuggestions =
+            await getVisibleAutocompleteTexts(page);
+
+        if (visibleSuggestions.length) {
+            console.log(
+                `🧪 Visible autocomplete choices: ` +
+                `${visibleSuggestions.join(" | ")}`,
+            );
+        }
+
+        await page.keyboard.press("Escape").catch(() => {});
+    }
+
+    console.log(
+        `⏭️ Exact autocomplete location was not offered: ${target}`,
+    );
+
+    return false;
+}
+
+
+async function getVisibleAutocompleteCandidatesNearInput(
+    page,
+    input,
+) {
+    const inputBox = await input.boundingBox().catch(() => null);
+
+    const selectors = [
+        '[role="option"]',
+        '[role="listbox"] li',
+        ".ui-autocomplete li",
+        ".autocomplete li",
+        '[class*="autocomplete"] li',
+        '[class*="autocomplete"] div',
+        '[class*="suggest"] li',
+        '[class*="suggest"] div',
+        '[class*="typeahead"] li',
+        '[class*="typeahead"] div',
+        '[data-testid*="suggest"]',
+    ].join(",");
+
+    const candidates = page.locator(selectors);
+    const count = Math.min(
+        await candidates.count().catch(() => 0),
+        80,
+    );
+
+    const visible = [];
+
+    for (let index = 0; index < count; index += 1) {
+        const candidate = candidates.nth(index);
+
+        if (!(await candidate.isVisible().catch(() => false))) {
+            continue;
+        }
+
+        const text = cleanText(
+            await candidate.innerText().catch(() => ""),
+        );
+
+        if (!text) {
+            continue;
+        }
+
+        const box = await candidate.boundingBox().catch(() => null);
+
+        if (
+            inputBox &&
+            box &&
+            (
+                box.y < inputBox.y - 15 ||
+                box.y > inputBox.y + 450
+            )
+        ) {
+            continue;
+        }
+
+        visible.push({
+            candidate,
+            text,
+            box,
+        });
+    }
+
+    return visible;
+}
+
+async function chooseExactNameSuggestion(
+    page,
+    input,
+    expectedValue,
+    fieldLabel,
+) {
+    const expected = cleanText(expectedValue);
+    const exactPattern = new RegExp(
+        `^${escapeRegex(expected)}$`,
+        "i",
+    );
+
+    await input.click();
+    await input.fill("");
+    await input.pressSequentially(expected, {
+        delay: 110,
+    });
+
+    const deadline = Date.now() + 4_500;
+
+    while (Date.now() < deadline) {
+        const visible =
+            await getVisibleAutocompleteCandidatesNearInput(
+                page,
+                input,
+            );
+
+        const exact = visible.find(({ text }) =>
+            exactPattern.test(text),
+        );
+
+        if (exact) {
+            try {
+                await exact.candidate.click({ timeout: 3_000 });
+            } catch {
+                // Suggestion re-rendered or vanished between detection and
+                // click; re-query on the next loop iteration instead of
+                // hanging on a hidden element.
+                continue;
+            }
+            await sleep(550);
+
+            console.log(
+                `✅ Selected ${fieldLabel} autocomplete: ${expected}`,
+            );
+
+            return true;
+        }
+
+        // Some versions render suggestions as plain text elements
+        // without a predictable autocomplete class.
+        const matches = page.getByText(exactPattern, {
+            exact: true,
+        });
+
+        const matchCount = Math.min(
+            await matches.count().catch(() => 0),
+            30,
+        );
+
+        const inputBox = await input.boundingBox().catch(() => null);
+
+        for (let index = matchCount - 1; index >= 0; index -= 1) {
+            const candidate = matches.nth(index);
+
+            if (!(await candidate.isVisible().catch(() => false))) {
+                continue;
+            }
+
+            const box = await candidate.boundingBox().catch(() => null);
+
+            if (
+                inputBox &&
+                box &&
+                (
+                    box.y < inputBox.y + inputBox.height - 15 ||
+                    box.y > inputBox.y + inputBox.height + 420
+                )
+            ) {
+                continue;
+            }
+
+            try {
+                await candidate.click({ timeout: 3_000 });
+            } catch {
+                // Stale/re-rendered suggestion; re-query next iteration.
+                continue;
+            }
+            await sleep(550);
+
+            console.log(
+                `✅ Selected ${fieldLabel} autocomplete: ${expected}`,
+            );
+
+            return true;
+        }
+
+        await sleep(300);
+    }
+
+    const visible =
+        await getVisibleAutocompleteCandidatesNearInput(
+            page,
+            input,
+        );
+
+    console.log(
+        `🧪 ${fieldLabel} autocomplete choices: ` +
+        `${visible.map(({ text }) => text).join(" | ") || "(none)"}`,
+    );
+
+    // No exact autocomplete match. Fall back to typing the value directly
+    // so the row proceeds instead of failing on a missing suggestion.
+    await input.click().catch(() => {});
+    await input.fill(expected).catch(() => {});
+
+    // Give the field time to commit the value before focus moves to the
+    // next input; otherwise the site can clear an uncommitted name.
+    await sleep(900);
+
+    console.log(
+        `⌨️ No exact ${fieldLabel} autocomplete match; typed ` +
+        `"${expected}" directly.`,
+    );
+
+    return true;
+}
+
+async function getCurrentFormValues(page) {
+    const {
+        firstNameInput,
+        lastNameInput,
+        cityStateInput,
+    } = await findSearchForm(page);
+
+    return {
+        firstNameInput,
+        lastNameInput,
+        cityStateInput,
+        firstName: cleanText(
+            await firstNameInput.inputValue().catch(() => ""),
+        ),
+        lastName: cleanText(
+            await lastNameInput.inputValue().catch(() => ""),
+        ),
+        cityState: cleanText(
+            await cityStateInput.inputValue().catch(() => ""),
+        ),
+    };
+}
+
+async function selectAndVerifyNamesAfterLocation(
+    page,
+    expectedFirstName,
+    expectedLastName,
+    expectedCity,
+    expectedState,
+) {
+    const expectedCityState =
+        `${cleanText(expectedCity)}, ` +
+        `${cleanText(expectedState).toUpperCase()}`;
+
+    const expectedCityStateRegex = new RegExp(
+        `^${escapeRegex(cleanText(expectedCity))}\\s*,\\s*` +
+        `${escapeRegex(cleanText(expectedState).toUpperCase())}$`,
+        "i",
+    );
+
+    let form = await getCurrentFormValues(page);
+
+    if (!expectedCityStateRegex.test(form.cityState)) {
+        throw new Error(
+            `The selected city/state was lost before selecting names. ` +
+            `Expected "${expectedCityState}", got "${form.cityState}".`,
+        );
+    }
+
+    console.log(
+        "✍️ Selecting first and last name autocomplete values...",
+    );
+
+    // The site clears an uncommitted name when focus moves to another
+    // field. Select each exact autocomplete value so the site commits it.
+    const firstSelected = await chooseExactNameSuggestion(
+        page,
+        form.firstNameInput,
+        expectedFirstName,
+        "First name",
+    );
+
+    if (!firstSelected) {
+        throw new Error(
+            `Exact First name autocomplete was not available for ` +
+            `"${expectedFirstName}".`,
+        );
+    }
+
+    // The form may rerender after each autocomplete selection.
+    form = await getCurrentFormValues(page);
+
+    const lastSelected = await chooseExactNameSuggestion(
+        page,
+        form.lastNameInput,
+        expectedLastName,
+        "Last name",
+    );
+
+    if (!lastSelected) {
+        throw new Error(
+            `Exact Last name autocomplete was not available for ` +
+            `"${expectedLastName}".`,
+        );
+    }
+
+    await sleep(600);
+    form = await getCurrentFormValues(page);
+
+    // Selecting Last name may rerender and clear First name. Re-select
+    // First name once more when needed, then verify the complete form.
+    if (form.firstName !== expectedFirstName) {
+        console.log(
+            `♻️ First name became "${form.firstName}". ` +
+            `Re-selecting "${expectedFirstName}"...`,
+        );
+
+        const firstReselected = await chooseExactNameSuggestion(
+            page,
+            form.firstNameInput,
+            expectedFirstName,
+            "First name",
+        );
+
+        if (!firstReselected) {
+            throw new Error(
+                `Could not re-select First name "${expectedFirstName}".`,
+            );
+        }
+
+        await sleep(500);
+        form = await getCurrentFormValues(page);
+    }
+
+    // Re-select Last name too if the First-name retry caused it to clear.
+    if (form.lastName !== expectedLastName) {
+        console.log(
+            `♻️ Last name became "${form.lastName}". ` +
+            `Re-selecting "${expectedLastName}"...`,
+        );
+
+        const lastReselected = await chooseExactNameSuggestion(
+            page,
+            form.lastNameInput,
+            expectedLastName,
+            "Last name",
+        );
+
+        if (!lastReselected) {
+            throw new Error(
+                `Could not re-select Last name "${expectedLastName}".`,
+            );
+        }
+
+        await sleep(500);
+        form = await getCurrentFormValues(page);
+    }
+
+    const searchButton = page
+        .locator(
+            'button[type="submit"].search-button.hp8-btn-search' +
+            '[aria-label="Search Records"]',
+        )
+        .first();
+
+    if (
+        (await searchButton.count().catch(() => 0)) &&
+        (await searchButton.isVisible().catch(() => false))
+    ) {
+        await searchButton.focus();
+    }
+
+    await sleep(300);
+
+    // Final ensure: type any name that didn't commit via autocomplete.
+    // Fill last name first, then first name, so the last field touched
+    // (first name) is less likely to be cleared on focus change.
+    form = await getCurrentFormValues(page);
+
+    if (form.lastName !== expectedLastName) {
+        await form.lastNameInput.click().catch(() => {});
+        await form.lastNameInput.fill(expectedLastName).catch(() => {});
+        await sleep(900);
+    }
+
+    if (form.firstName !== expectedFirstName) {
+        await form.firstNameInput.click().catch(() => {});
+        await form.firstNameInput.fill(expectedFirstName).catch(() => {});
+        await sleep(900);
+    }
+
+    form = await getCurrentFormValues(page);
+
+    console.log("🧾 Final search form values:", {
+        firstName: form.firstName,
+        lastName: form.lastName,
+        cityState: form.cityState,
+    });
+
+    if (form.firstName !== expectedFirstName) {
+        console.warn(
+            `⚠️ First name not retained (got "${form.firstName}", ` +
+            `expected "${expectedFirstName}"); proceeding anyway.`,
+        );
+    }
+
+    if (form.lastName !== expectedLastName) {
+        console.warn(
+            `⚠️ Last name not retained (got "${form.lastName}", ` +
+            `expected "${expectedLastName}"); proceeding anyway.`,
+        );
+    }
+
+    if (!expectedCityStateRegex.test(form.cityState)) {
+        throw new Error(
+            `City/state was not retained before search. ` +
+            `Expected "${expectedCityState}", got "${form.cityState}".`,
+        );
+    }
+}
+
+async function submitSearch(page) {
+    console.log('🖱️ Clicking "Search Records"...');
+
+    const exactButton = page
+        .locator(
+            'button[type="submit"].search-button.hp8-btn-search' +
+            '[aria-label="Search Records"]',
+        )
+        .first();
+
+    if (
+        (await exactButton.count().catch(() => 0)) &&
+        (await exactButton.isVisible().catch(() => false))
+    ) {
+        await Promise.all([
+            page
+                .waitForLoadState("domcontentloaded", {
+                    timeout: 45_000,
+                })
+                .catch(() => {}),
+            exactButton.click(),
+        ]);
+
+        // Let the results / captcha page load before we act on it.
+        await waitForPageSettled(page);
+        console.log('✅ Clicked "Search Records".');
+        return;
+    }
+
+    // Fallbacks in case FamilyTreeNow changes one class or attribute.
+    const candidates = [
+        page
+            .locator('button[aria-label="Search Records"][type="submit"]')
+            .first(),
+        page
+            .getByRole("button", {
+                name: /^Search Records$/i,
+            })
+            .first(),
+        page
+            .locator('button[type="submit"]')
+            .filter({ hasText: /^Search Records$/i })
+            .first(),
+    ];
+
+    for (const candidate of candidates) {
+        if (
+            (await candidate.count().catch(() => 0)) &&
+            (await candidate.isVisible().catch(() => false))
+        ) {
+            await Promise.all([
+                page
+                    .waitForLoadState("domcontentloaded", {
+                        timeout: 45_000,
+                    })
+                    .catch(() => {}),
+                candidate.click(),
+            ]);
+
+            await waitForPageSettled(page);
+            console.log('✅ Clicked "Search Records" using fallback selector.');
+            return;
+        }
+    }
+
+    throw new Error(
+        'Could not find the FamilyTreeNow "Search Records" submit button.',
+    );
+}
+
+// ---- Cloudflare Turnstile solving (2captcha) ----
+
+async function twoCaptchaRequest(endpoint, payload) {
+    const response = await fetch(`${TWO_CAPTCHA_API}/${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+
+    return response.json();
+}
+
+async function solveTurnstileVia2Captcha(task) {
+    if (!TWO_CAPTCHA_KEY) {
+        throw new Error(
+            "TWO_CAPTCHA_API_KEY is not set; cannot solve Turnstile.",
+        );
+    }
+
+    const created = await twoCaptchaRequest("createTask", {
+        clientKey: TWO_CAPTCHA_KEY,
+        task,
+    });
+
+    if (created.errorId) {
+        throw new Error(
+            `2captcha createTask failed: ` +
+            `${created.errorDescription || created.errorId}`,
+        );
+    }
+
+    const taskId = created.taskId;
+    const deadline = Date.now() + CAPTCHA_POLL_TIMEOUT_MS;
+
+    while (Date.now() < deadline) {
+        await sleep(CAPTCHA_POLL_INTERVAL_MS);
+
+        const result = await twoCaptchaRequest("getTaskResult", {
+            clientKey: TWO_CAPTCHA_KEY,
+            taskId,
+        });
+
+        if (result.errorId) {
+            throw new Error(
+                `2captcha getTaskResult failed: ` +
+                `${result.errorDescription || result.errorId}`,
+            );
+        }
+
+        if (result.status === "ready" && result.solution) {
+            return result.solution;
+        }
+    }
+
+    throw new Error("2captcha timed out waiting for Turnstile solution.");
+}
+
+async function isOnCaptchaPage(page) {
+    const url = page.url();
+
+    if (/internalcaptcha/i.test(url)) {
+        return true;
+    }
+
+    const widgetCount = await page
+        .locator(
+            ".cf-turnstile, [data-sitekey], " +
+            'iframe[src*="challenges.cloudflare.com"], ' +
+            '[name="cf-turnstile-response"]',
+        )
+        .count()
+        .catch(() => 0);
+
+    return widgetCount > 0;
+}
+
+async function getTurnstileSitekey(page) {
+    // The Turnstile widget may not have rendered (and turnstile.render
+    // captured) the instant we detect the captcha page. Poll for up to
+    // ~6s before giving up so a slow-loading widget doesn't fail the row
+    // with "sitekey could not be found".
+    const deadline = Date.now() + 6000;
+
+    while (Date.now() < deadline) {
+        const fromInterception = await page
+            .evaluate(() => window.__tsInfo && window.__tsInfo.websiteKey)
+            .catch(() => null);
+
+        if (fromInterception) {
+            return fromInterception;
+        }
+
+        const fromDom = await page
+            .locator("[data-sitekey]")
+            .first()
+            .getAttribute("data-sitekey")
+            .catch(() => null);
+
+        if (fromDom) {
+            return fromDom;
+        }
+
+        await new Promise((r) => setTimeout(r, 500));
+    }
+
+    return null;
+}
+
+async function getExistingTurnstileToken(page) {
+    return page
+        .evaluate(() => {
+            const el = document.querySelector(
+                '[name="cf-turnstile-response"], ' +
+                '[name="g-recaptcha-response"], ' +
+                "#cf-turnstile-response",
+            );
+
+            return el ? (el.value || "").trim() : "";
+        })
+        .catch(() => "");
+}
+
+async function injectTurnstileToken(page, token) {
+    await page.evaluate((token) => {
+        const selectors =
+            '[name="cf-turnstile-response"], ' +
+            '[name="g-recaptcha-response"], ' +
+            "#cf-turnstile-response";
+
+        document
+            .querySelectorAll(selectors)
+            .forEach((el) => {
+                el.value = token;
+            });
+
+        if (typeof window.__tsCallback === "function") {
+            try {
+                window.__tsCallback(token);
+            } catch (e) {}
+        }
+    }, token);
+}
+
+async function clickCaptchaSubmit(page) {
+    const candidates = [
+        page.locator('button:has-text("Submit")').first(),
+        page.locator('input[type="submit"][value="Submit"]').first(),
+        page.getByRole("button", { name: /^Submit$/i }).first(),
+    ];
+
+    for (const candidate of candidates) {
+        if (
+            (await candidate.count().catch(() => 0)) &&
+            (await candidate.isVisible().catch(() => false))
+        ) {
+            const enabled = await candidate.isEnabled().catch(() => true);
+
+            if (!enabled) {
+                return false;
+            }
+
+            await candidate.click().catch(() => {});
+            return true;
+        }
+    }
+
+    return false;
+}
+
+async function solveFamilyTreeNowTurnstile(page) {
+    const websiteURL = page.url();
+    const solveStart = Date.now();
+
+    // 1. The widget may have auto-solved (managed mode shows a green check).
+    // In that case a token already exists and we just need to submit it.
+    let token = await getExistingTurnstileToken(page);
+
+    if (!token) {
+        const sitekey = await getTurnstileSitekey(page);
+
+        if (!sitekey) {
+            throw new Error(
+                "Turnstile detected but sitekey could not be found.",
+            );
+        }
+
+        // 2. Build the task from the intercepted render call. When the
+        // interception captured action / cData / chlPageData (challenge
+        // pages), they are included; otherwise this is a plain standalone
+        // widget and only websiteURL + websiteKey are sent.
+        const info = await page
+            .evaluate(() => window.__tsInfo || {})
+            .catch(() => ({}));
+
+        const callbackCaptured = await page
+            .evaluate(() => typeof window.__tsCallback === "function")
+            .catch(() => false);
+
+        const task = {
+            type: "TurnstileTaskProxyless",
+            websiteURL,
+            websiteKey: sitekey,
+        };
+
+        if (info.action) task.action = info.action;
+        if (info.data) task.cData = info.data;
+        if (info.pagedata) task.pagedata = info.pagedata;
+
+        console.log(
+            `🔐 Solving Cloudflare Turnstile ` +
+            `(sitekey ${sitekey}) via 2captcha... ` +
+                `callback captured: ${callbackCaptured}.`,
+        );
+
+        const solution = await solveTurnstileVia2Captcha(task);
+        token = solution.token;
+
+        console.log(
+            `🔓 2captcha returned token (${token.length} chars).`,
+        );
+    } else {
+        console.log(
+            "🔓 Turnstile already solved by the widget; " +
+            "submitting the existing token.",
+        );
+    }
+
+    // 3. Write the token into the hidden inputs and fire the captured
+    // callback. The callback often triggers an auto-submit navigation,
+    // which destroys the execution context while evaluate is still
+    // running — that is the captcha passing, so swallow it.
+    try {
+        await injectTurnstileToken(page, token);
+    } catch (error) {
+        if (
+            !/execution context was destroyed|navigation|target closed/i.test(
+                error.message,
+            )
+        ) {
+            throw error;
+        }
+
+        console.log(
+            "ℹ️ Token injection triggered a navigation " +
+            "(likely auto-submit).",
+        );
+    }
+
+    // 4. If we're still on the captcha page, click Submit explicitly.
+    await sleep(1_000);
+
+    if (await isOnCaptchaPage(page)) {
+        const clicked = await clickCaptchaSubmit(page);
+
+        if (!clicked) {
+            console.log(
+                "ℹ️ No clickable Submit button found; " +
+                "relying on the callback to auto-submit.",
+            );
+        }
+    }
+
+    // 5. Wait until we leave the captcha page / the widget is gone.
+    await Promise.race([
+        page
+            .waitForURL((url) => !/internalcaptcha/i.test(url.href), {
+                timeout: 30_000,
+            })
+            .catch(() => {}),
+        page
+            .waitForFunction(
+                () =>
+                    !document.querySelector(
+                        ".cf-turnstile, [data-sitekey]",
+                    ),
+                { timeout: 30_000 },
+            )
+            .catch(() => {}),
+    ]);
+
+    await sleep(1_500);
+
+    if (await isOnCaptchaPage(page)) {
+        throw new Error(
+            "Turnstile submit did not leave the captcha page " +
+                `(after ${Date.now() - solveStart}ms).`,
+        );
+    }
+
+    // The captcha pass navigated us somewhere (results or back to the
+    // search form). Let it settle before the caller acts on the page.
+    await waitForPageSettled(page);
+
+    console.log(
+        `✅ Turnstile passed (cleared in ${
+            Date.now() - solveStart
+        }ms).`,
+    );
+}
+
+async function ensureCaptchaSolved(page) {
+    for (
+        let attempt = 1;
+        attempt <= MAX_CAPTCHA_ATTEMPTS;
+        attempt += 1
+    ) {
+        if (!(await isOnCaptchaPage(page))) {
+            return true;
+        }
+
+        console.log(
+            `🧩 Captcha detected ` +
+            `(attempt ${attempt}/${MAX_CAPTCHA_ATTEMPTS}).`,
+        );
+
+        await solveFamilyTreeNowTurnstile(page);
+        await sleep(1_000);
+    }
+
+    if (await isOnCaptchaPage(page)) {
+        throw new Error(
+            "CAPTCHA could not be solved after " +
+            `${MAX_CAPTCHA_ATTEMPTS} attempts.`,
+        );
+    }
+
+    return true;
+}
+
+async function detectCaptcha(page) {
+    const bodyText = cleanText(
+        await page.locator("body").innerText().catch(() => ""),
+    );
+
+    const captchaElementCount = await page
+        .locator(
+            'iframe[src*="recaptcha"], .g-recaptcha, ' +
+            '[data-sitekey]',
+        )
+        .count()
+        .catch(() => 0);
+
+    return (
+        captchaElementCount > 0 ||
+        /captcha|verify you are human|unusual traffic/i.test(
+            bodyText,
+        )
+    );
+}
+
+function normalizeLocationForComparison(value = "") {
+    return cleanText(value)
+        .normalize("NFD")
+        .replace(/\p{Diacritic}/gu, "")
+        .replace(/[’']/g, "")
+        .replace(/[^a-z0-9]+/gi, " ")
+        .trim()
+        .toLowerCase();
+}
+
+async function getFamilyTreeNowResults(page, person, city, state) {
+    const expectedCity =
+        normalizeLocationForComparison(city);
+
+    const expectedState =
+        cleanText(state).toUpperCase();
+
+    // Detail links normally carry the `detail-link` class or a
+    // `data-perma-link` attribute, but FTN's "expanded matches" page
+    // (shown when there are no exact matches) renders result cards whose
+    // only detail link is the name heading — an anchor whose href points
+    // at a /record/ or /search/people/ URL. Include those by URL pattern
+    // so expanded-match results (e.g. Rachel O'Bier, who LIVED in the
+    // search city but no longer LIVES there) are still picked up.
+    const DETAIL_LINK_SELECTOR =
+        "a.detail-link[href], a[data-perma-link][href], " +
+        "a[href*='/record/'], a[href*='/search/people/']";
+
+    await page
+        .waitForSelector(DETAIL_LINK_SELECTOR, {
+            state: "attached",
+            timeout: 12_000,
+        })
+        .catch(() => {});
+
+    // Read all detail-link cards in a SINGLE DOM pass. The previous
+    // per-button locator.evaluate() calls could hang for the full default
+    // 30s timeout when the results DOM churned (vignette ads, lazy
+    // re-rendering) right after a Turnstile auto-submit. One evaluate runs
+    // once in the page context and returns [] on a navigation error instead
+    // of hanging.
+    const cards = await page
+        .evaluate(() => {
+            const clean = (value) =>
+                String(value || "").replace(/\s+/g, " ").trim();
+
+            const links = Array.from(
+                document.querySelectorAll(
+                    "a.detail-link[href], a[data-perma-link][href], " +
+                        "a[href*='/record/'], a[href*='/search/people/']",
+                ),
+            ).filter((element) => {
+                // Skip hidden/template duplicate links so dedupe-by-href
+                // keeps the visible card, not a stale hidden copy.
+                if (!element.getClientRects().length) {
+                    return false;
+                }
+
+                const style = window.getComputedStyle(element);
+
+                return (
+                    style.display !== "none" &&
+                    style.visibility !== "hidden" &&
+                    parseFloat(style.opacity) !== 0
+                );
+            });
+
+            return links.map((element) => {
+                let current = element;
+
+                for (let depth = 0; depth < 12 && current; depth += 1) {
+                    const text = clean(
+                        current.innerText || current.textContent,
+                    );
+
+                    if (
+                        /\bNAME:/i.test(text) &&
+                        /\bLIVES\s+IN:/i.test(text)
+                    ) {
+                        return { href: element.href, text };
+                    }
+
+                    current = current.parentElement;
+                }
+
+                const fallback =
+                    element.closest(
+                        "tr, article, .row, .card, " +
+                        "[class*='record'], [class*='result']",
+                    ) || element.parentElement;
+
+                return {
+                    href: element.href,
+                    text: clean(
+                        fallback?.innerText || fallback?.textContent,
+                    ),
+                };
+            });
+        })
+        .catch(() => []);
+
+    const results = [];
+    const seenHrefs = new Set();
+
+    // Dedupe by the per-card `smck` token, preferring the link that carries
+    // `rid=` (the real "View Details" detail-page link) over the card's name
+    // link (which points back at the results listing and has no `rid`). The
+    // broadened selector otherwise double-counts each card, wasting an
+    // attempt on the listing page before the real detail link succeeds.
+    const dedupedCards = [];
+    const smckIndex = new Map();
+
+    for (const card of cards) {
+        const href = card.href || "";
+        const smck =
+            (href.match(/[?&]smck=([^&#]+)/) || [])[1];
+        const key = smck || href || `button-${dedupedCards.length}`;
+        const hasRid = /[?&]rid=/.test(href);
+        const previousIndex = smckIndex.get(key);
+
+        if (previousIndex === undefined) {
+            smckIndex.set(key, dedupedCards.length);
+            dedupedCards.push(card);
+        } else if (
+            hasRid &&
+            !/[?&]rid=/.test(dedupedCards[previousIndex].href || "")
+        ) {
+            dedupedCards[previousIndex] = card;
+        }
+    }
+
+    dedupedCards.forEach((card, index) => {
+        const href = card.href || `button-${index}`;
+
+        if (seenHrefs.has(href)) {
+            return;
+        }
+
+        seenHrefs.add(href);
+
+        const cardInfo = { text: card.text };
+
+        const cardText = cleanText(cardInfo.text);
+
+        const nameMatch = cardText.match(
+            /\bNAME:\s*(.+?)(?=\s+BORN:|\s+AGE:|\s+LIVES\s+IN:|$)/i,
+        );
+
+        const livesInMatch = cardText.match(
+            /\bLIVES\s+IN:\s*([^,]+?)\s*,\s*([A-Z]{2})\b/i,
+        );
+
+        // LIVED IN (past residences). Capture everything up to the next
+        // card label so we can fall back to it when no LIVES IN match exists.
+        // FTN's past-residences label is usually "LIVED IN:" but on the
+        // "expanded matches" page it is abbreviated to "LIVED:". Tolerate
+        // both, and stop the capture at the next card label (RELATED appears
+        // as both "RELATED:" and "RELATED TO:") so we only grab cities.
+        const livedInSegment = cardText.match(
+            /\bLIVED(?:\s+IN)?:\s*(.+?)(?=\s+(?:BORN:|AGE:|LIVES\s+IN:|RELATED(?:\s+TO)?:|VIEW DETAILS|NAME:|GO TO|PREVIOUS)|$)/i,
+        );
+
+        const livedInText = cleanText(livedInSegment?.[1] || "");
+        const livedInNormalized =
+            normalizeLocationForComparison(livedInText);
+
+        const resultName =
+            cleanText(nameMatch?.[1] || "");
+
+        const livesInCity =
+            cleanText(livesInMatch?.[1] || "");
+
+        const livesInState =
+            cleanText(livesInMatch?.[2] || "").toUpperCase();
+
+        // Segment-based match: first name must be exact, and the final
+        // last-name segment must match. This lets a search for "Shelton"
+        // match a result shown as "Evan Partlow Shelton" (hyphenated names
+        // are searched by their last segment), while still excluding
+        // genuinely different names like Christa vs Kristina Roth.
+        const nameMatches =
+            firstNameSegment(resultName) ===
+                firstNameSegment(person.fullName) &&
+            lastNameSegment(resultName) ===
+                lastNameSegment(person.fullName);
+
+        const cityMatches =
+            normalizeLocationForComparison(livesInCity) ===
+            expectedCity;
+
+        const stateMatches =
+            livesInState === expectedState;
+
+        const directLocationMatch =
+            cityMatches && stateMatches;
+
+        // True when the requested city (and state, if known) appears in the
+        // LIVED IN section. Used as a fallback when no LIVES IN match exists.
+        const livedInCityMatch =
+            Boolean(expectedCity) &&
+            livedInNormalized.length > 0 &&
+            new RegExp(`\b${escapeRegex(expectedCity)}\b`).test(
+                livedInNormalized,
+            ) &&
+            (expectedState
+                ? new RegExp(
+                      `\b${escapeRegex(
+                          expectedState.toLowerCase(),
+                      )}\b`,
+                  ).test(livedInNormalized)
+                : true);
+
+        results.push({
+            href,
+            index,
+            cardText,
+            resultName,
+            livesInCity,
+            livesInState,
+            livedInText,
+            livedInCityMatch,
+            nameMatches,
+            directLocationMatch,
+        });
+    });
+
+    return results;
+}
+
+// Approximate coordinates for common DFW / North Texas cities in this
+// dataset, keyed by normalizeLocationForComparison(city). Used as a fast,
+// dependency-free geocoder for the nearby-city fallback so we don't have to
+// hit an external API for the common cases.
+const CITY_COORD_SEED = {
+    dallas: { lat: 32.7767, lon: -96.797 },
+    "fort worth": { lat: 32.7555, lon: -97.3308 },
+    arlington: { lat: 32.7357, lon: -97.1087 },
+    plano: { lat: 33.0198, lon: -96.6989 },
+    allen: { lat: 33.1032, lon: -96.6706 },
+    wylie: { lat: 33.0151, lon: -96.5389 },
+    mckinney: { lat: 33.1972, lon: -96.6398 },
+    frisco: { lat: 33.1507, lon: -96.8236 },
+    princeton: { lat: 33.1632, lon: -96.4997 },
+    irving: { lat: 32.814, lon: -96.9489 },
+    garland: { lat: 32.9126, lon: -96.6389 },
+    denton: { lat: 33.2148, lon: -97.1331 },
+    rockwall: { lat: 32.9315, lon: -96.4594 },
+    sachse: { lat: 32.9762, lon: -96.5953 },
+    lewisville: { lat: 33.0462, lon: -96.9942 },
+    coppell: { lat: 32.9546, lon: -97.015 },
+    "cedar hill": { lat: 32.5885, lon: -96.9561 },
+    melissa: { lat: 33.2873, lon: -96.573 },
+    "farmers branch": { lat: 32.9265, lon: -96.8961 },
+    hurst: { lat: 32.8362, lon: -97.1706 },
+    richardson: { lat: 32.9483, lon: -96.7297 },
+    bedford: { lat: 32.844, lon: -97.1431 },
+    carrollton: { lat: 32.9537, lon: -96.8903 },
+    "the colony": { lat: 33.0387, lon: -96.8864 },
+    "little elm": { lat: 33.1626, lon: -96.9375 },
+    prosper: { lat: 33.2384, lon: -96.8011 },
+    celina: { lat: 33.3245, lon: -96.7847 },
+    anna: { lat: 33.349, lon: -96.552 },
+    sherman: { lat: 33.6412, lon: -96.6091 },
+    denison: { lat: 33.7495, lon: -96.5369 },
+    tomball: { lat: 30.0971, lon: -95.6161 },
+    whitesboro: { lat: 33.6562, lon: -96.9059 },
+    northlake: { lat: 33.2457, lon: -97.2453 },
+    "north richland hills": { lat: 32.8562, lon: -97.225 },
+    addison: { lat: 32.9487, lon: -96.8353 },
+    murphy: { lat: 33.0151, lon: -96.6147 },
+    parker: { lat: 33.0501, lon: -96.6272 },
+    lucas: { lat: 33.1007, lon: -96.5747 },
+    lavon: { lat: 33.0115, lon: -96.3493 },
+    nevada: { lat: 33.049, lon: -96.3732 },
+    watauga: { lat: 32.8362, lon: -97.2497 },
+    keller: { lat: 32.9346, lon: -97.252 },
+    southlake: { lat: 32.9415, lon: -97.1342 },
+    grapevine: { lat: 32.9343, lon: -97.0781 },
+    colleyville: { lat: 32.8757, lon: -97.125 },
+    euless: { lat: 32.8371, lon: -97.082 },
+    mansfield: { lat: 32.5632, lon: -97.1417 },
+    midlothian: { lat: 32.4823, lon: -96.9944 },
+    waxahachie: { lat: 32.3865, lon: -96.8483 },
+    ennis: { lat: 32.3293, lon: -96.6272 },
+    desoto: { lat: 32.5971, lon: -96.8651 },
+    duncanville: { lat: 32.6518, lon: -96.9083 },
+    lancaster: { lat: 32.5921, lon: -96.7564 },
+    "grand prairie": { lat: 32.7457, lon: -97.0067 },
+    mesquite: { lat: 32.7668, lon: -96.5992 },
+    rowlett: { lat: 32.9029, lon: -96.563 },
+    heath: { lat: 32.8515, lon: -96.5089 },
+    forney: { lat: 32.7482, lon: -96.472 },
+    terrell: { lat: 32.7357, lon: -96.2753 },
+    "richmond": { lat: 29.5811, lon: -95.7608 },
+    "new braunfels": { lat: 29.703, lon: -98.1245 },
+    conroe: { lat: 30.3119, lon: -95.4561 },
+    // Additional North Texas cities observed in the general-contracting
+    // dataset (so the nearby-city fallback can compute distance for
+    // cross-city matches like Northlake <-> Justin).
+    justin: { lat: 33.0837, lon: -97.3546 },
+    roanoke: { lat: 33.0045, lon: -97.2267 },
+    "haltom city": { lat: 32.8046, lon: -97.2692 },
+    "flower mound": { lat: 33.0146, lon: -97.0969 },
+    benbrook: { lat: 32.6732, lon: -97.4609 },
+    saginaw: { lat: 32.8601, lon: -97.3647 },
+    haslet: { lat: 32.9579, lon: -97.3425 },
+    "trophy club": { lat: 33.0051, lon: -97.1886 },
+    burleson: { lat: 32.5429, lon: -97.3219 },
+    argyle: { lat: 33.1176, lon: -97.1861 },
+    azle: { lat: 32.8954, lon: -97.5553 },
+    weatherford: { lat: 32.7593, lon: -97.7973 },
+    corinth: { lat: 33.1434, lon: -97.0645 },
+    aubrey: { lat: 33.3042, lon: -96.9847 },
+    sanger: { lat: 33.3643, lon: -97.1756 },
+    krugerville: { lat: 33.2773, lon: -97.0258 },
+    "lake dallas": { lat: 33.1282, lon: -97.0267 },
+    "shady shores": { lat: 33.1643, lon: -97.0303 },
+    ponder: { lat: 33.1793, lon: -97.0306 },
+    newark: { lat: 33.004, lon: -97.486 },
+    boyd: { lat: 33.0768, lon: -97.5661 },
+    "copper canyon": { lat: 33.1118, lon: -97.0974 },
+    bartonville: { lat: 33.0743, lon: -97.1489 },
+    "oak point": { lat: 33.1809, lon: -96.9947 },
+    "hickory creek": { lat: 33.2212, lon: -97.0377 },
+    krum: { lat: 33.2612, lon: -97.3903 },
+    rhome: { lat: 33.4157, lon: -97.4086 },
+};
+
+const CITY_COORDS = new Map();
+let LAST_GEOCODE_AT = 0;
+
+// Returns {lat, lon} for a city. Uses the bundled DFW seed map first, then
+// optionally Nominatim (OpenStreetMap) when FTN_ENABLE_EXTERNAL_GEOCODER=1.
+// External geocoding is best-effort and never blocks a row: on any failure
+// it returns null so the proximity tier is simply skipped.
+async function geocodeCity(city, state) {
+    const cityNorm = normalizeLocationForComparison(city);
+
+    if (!cityNorm) {
+        return null;
+    }
+
+    if (CITY_COORDS.has(cityNorm)) {
+        return CITY_COORDS.get(cityNorm);
+    }
+
+    if (CITY_COORD_SEED[cityNorm]) {
+        CITY_COORDS.set(cityNorm, CITY_COORD_SEED[cityNorm]);
+        return CITY_COORD_SEED[cityNorm];
+    }
+
+    if (process.env.FTN_ENABLE_EXTERNAL_GEOCODER !== "1") {
+        CITY_COORDS.set(cityNorm, null);
+        return null;
+    }
+
+    const stateNorm = cleanText(state).toUpperCase();
+    const query = encodeURIComponent(
+        `${cleanText(city)}, ${stateNorm}, USA`,
+    );
+
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+        // Nominatim usage policy: max 1 request per second.
+        const elapsed = Date.now() - LAST_GEOCODE_AT;
+        const wait = Math.max(0, 1100 - elapsed);
+        if (wait > 0) await sleep(wait);
+
+        LAST_GEOCODE_AT = Date.now();
+
+        try {
+            const response = await fetch(
+                `https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=us&q=${query}`,
+                {
+                    headers: {
+                        "User-Agent":
+                            "ftn-enrichment/1.0 (evanligon7@gmail.com)",
+                    },
+                    signal: AbortSignal.timeout(8_000),
+                },
+            );
+
+            if (response.status === 429) {
+                await sleep(2_000);
+                continue;
+            }
+
+            const data = await response.json();
+            const hit = Array.isArray(data) ? data[0] : null;
+            const coord = hit
+                ? {
+                      lat: parseFloat(hit.lat),
+                      lon: parseFloat(hit.lon),
+                  }
+                : null;
+
+            CITY_COORDS.set(cityNorm, coord);
+            return coord;
+        } catch {
+            // retry once on transient errors
+        }
+    }
+
+    CITY_COORDS.set(cityNorm, null);
+    return null;
+}
+
+function haversineMiles(a, b) {
+    if (!a || !b) return Infinity;
+    const toRad = (degrees) => (degrees * Math.PI) / 180;
+    const radius = 3958.8;
+    const dLat = toRad(b.lat - a.lat);
+    const dLon = toRad(b.lon - a.lon);
+    const lat1 = toRad(a.lat);
+    const lat2 = toRad(b.lat);
+    const h =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+    return 2 * radius * Math.asin(Math.sqrt(h));
+}
+
+// Pick the closest result whose LIVES IN city is in the same state and
+// within maxMiles of the requested city. Only considers results whose name
+// matches exactly (nameMatches) so we don't open a different person who
+// merely shares a name and lives nearby.
+async function findNearbyResults(results, city, state, maxMiles) {
+    const target = await geocodeCity(city, state);
+
+    if (!target) {
+        return [];
+    }
+
+    const expectedState = cleanText(state).toUpperCase();
+    const nearby = [];
+
+    for (const result of results) {
+        if (!result.nameMatches) {
+            continue;
+        }
+
+        if (!result.livesInCity || result.livesInState !== expectedState) {
+            continue;
+        }
+
+        const coord = await geocodeCity(
+            result.livesInCity,
+            result.livesInState,
+        );
+
+        if (!coord) {
+            continue;
+        }
+
+        const distanceMi = haversineMiles(target, coord);
+
+        if (distanceMi <= maxMiles) {
+            nearby.push({ ...result, _distanceMi: distanceMi });
+        }
+    }
+
+    nearby.sort((a, b) => a._distanceMi - b._distanceMi);
+
+    return nearby;
+}
+
+/**
+ * Selection rule — returns an ORDERED list of candidate results within the
+ * best tier that matched, so the caller can try each one until a mobile phone
+ * is found (e.g. when the first exact match has no wireless number).
+ *
+ * 1. All results whose LIVES IN city/state is an exact match, in result
+ *    order (first, then later matches).
+ * 2. Otherwise, all results where the requested city appears in LIVED IN
+ *    (past residences), in result order.
+ * 3. Otherwise, all same-state results whose LIVES IN city is within
+ *    FTN_NEARBY_CITY_MILES (default 35) of the requested city — e.g. Allen
+ *    for someone searched in Wylie — sorted nearest-first, but only when
+ *    the name matches exactly. Disabled when FTN_NEARBY_CITY_MILES=0.
+ * 4. Otherwise, return [] and skip the person rather than opening an
+ *    unrelated record.
+ */
+async function chooseFamilyTreeNowResults(
+    page,
+    person,
+    city,
+    state,
+) {
+    const results = await getFamilyTreeNowResults(
+        page,
+        person,
+        city,
+        state,
+    );
+
+    if (!results.length) {
+        await logZeroResultsDiagnostics(page, person);
+        console.log(
+            `⏭️ No visible View Details results for ` +
+            `${person.fullName}.`,
+        );
+
+        return [];
+    }
+
+    console.log(
+        `📋 FamilyTreeNow returned ${results.length} result(s).`,
+    );
+
+    for (const [position, result] of results.entries()) {
+        const tags = [
+            result.directLocationMatch ? "DIRECT MATCH" : "not a direct match",
+            result.livedInCityMatch ? "LIVED IN MATCH" : "",
+        ]
+            .filter(Boolean)
+            .join(" | ");
+
+        console.log(
+            `   [${position + 1}] ` +
+            `${result.resultName || "(name unavailable)"} | ` +
+            `LIVES IN: ` +
+            `${result.livesInCity || "(unknown city)"}, ` +
+            `${result.livesInState || "(unknown state)"} | ` +
+            `${tags}`,
+        );
+
+        // Surface the raw card text when we failed to parse a name AND a
+        // city, so the next run reveals whether the card uses a different
+        // label/layout (e.g. an expanded-match card) we should handle.
+        if (!result.resultName && !result.livesInCity) {
+            console.log(
+                `   🔎 [diag] unparseable result card — ` +
+                    `raw: ${(result.cardText || "").slice(0, 220)}`,
+            );
+        }
+    }
+
+    // Tier 1: exact LIVES IN matches. Prefer results whose NAME also
+    // matches exactly, so "try the next result" only iterates the same
+    // person (e.g. two Monika Agarwal records) and never saves a different
+    // person's phone (e.g. Christa/Christopher Roth for a Kristina Roth
+    // search). If no exact-name match exists, fall back to a single
+    // permissive location match (old behavior) without iterating further.
+    const directMatches = results.filter(
+        (result) => result.directLocationMatch,
+    );
+
+    if (directMatches.length) {
+        const directExactName = directMatches.filter(
+            (result) => result.nameMatches,
+        );
+
+        const chosen =
+            directExactName.length > 0
+                ? directExactName
+                : [directMatches[0]];
+
+        if (chosen[0] === results[0]) {
+            console.log(
+                `✅ First result directly matches ${city}, ${state}.`,
+            );
+        } else {
+            console.log(
+                `✅ Using result ${chosen[0].index + 1}, ` +
+                `the first record with an exact LIVES IN match.`,
+            );
+        }
+
+        console.log(
+            `   Will try up to ${chosen.length} ` +
+            `${directExactName.length > 0 ? "exact-name " : ""}` +
+            `match(es) for a mobile phone.`,
+        );
+
+        return chosen;
+    }
+
+    console.log(
+        `ℹ️ First result does not directly match ${city}, ${state}.`,
+    );
+
+    // Tier 2: requested city appears in LIVED IN (past residences). Same
+    // exact-name preference as tier 1 so we only iterate the same person.
+    const livedInMatches = results.filter(
+        (result) => result.livedInCityMatch,
+    );
+
+    if (livedInMatches.length) {
+        const livedInExactName = livedInMatches.filter(
+            (result) => result.nameMatches,
+        );
+
+        const chosen =
+            livedInExactName.length > 0
+                ? livedInExactName
+                : [livedInMatches[0]];
+
+        console.log(
+            `✅ Using result ${chosen[0].index + 1}, ` +
+            `the first record where ${city}, ${state} appears in LIVED IN.`,
+        );
+
+        if (chosen.length > 1) {
+            console.log(
+                `   Will try up to ${chosen.length} ` +
+                `exact-name match(es) for a mobile phone.`,
+            );
+        }
+
+        return chosen;
+    }
+
+    // Tier 3: geographic proximity fallback.
+    const nearbyMiles = Number(
+        process.env.FTN_NEARBY_CITY_MILES ?? 35,
+    );
+
+    if (nearbyMiles > 0) {
+        const nearby = await findNearbyResults(
+            results,
+            city,
+            state,
+            nearbyMiles,
+        );
+
+        if (nearby.length) {
+            const first = nearby[0];
+            console.log(
+                `✅ Using result ${first.index + 1} — ` +
+                `LIVES IN ${first.livesInCity}, ` +
+                `${first.livesInState} is ` +
+                `${first._distanceMi.toFixed(1)} mi from ` +
+                `${city}, ${state} | NEARBY MATCH`,
+            );
+
+            return nearby;
+        }
+    }
+
+    console.log(
+        `⏭️ None of the results had an exact LIVES IN match for ` +
+        `${city}, ${state}.`,
+    );
+
+    return [];
+}
+
+// True when the URL looks like a real FamilyTreeNow detail/record page
+// (not the /search/genealogy/results listing). The #google_vignette
+// fragment is just an AdSense interstitial trigger that can sit on top of
+// a real detail URL, so it is ignored for this check.
+function isDetailUrl(url) {
+    if (!url) return false;
+    const path = url.split("#")[0];
+    if (/\/search\/genealogy\/results/i.test(path)) return false;
+    return /\/record\/|\/search\/people\//i.test(path);
+}
+
+// Dismiss a Google vignette ad overlay that can appear after clicking
+// View Details. These ads render in cross-origin iframes, so we try
+// Escape + common close selectors and strip obvious ad containers.
+async function dismissVignette(page) {
+    await page.keyboard.press("Escape").catch(() => {});
+    await sleep(400);
+
+    const closeSelectors = [
+        "#dismiss-button",
+        "[id*='dismiss' i]",
+        ".ads-button-close",
+        "[aria-label='Close ad' i]",
+        "[aria-label='Close' i]",
+        ".ad-close",
+    ];
+
+    for (const selector of closeSelectors) {
+        const candidate = page.locator(selector).first();
+
+        if (
+            (await candidate.count().catch(() => 0)) &&
+            (await candidate.isVisible().catch(() => false))
+        ) {
+            await candidate
+                .click({ force: true, timeout: 2_000 })
+                .catch(() => {});
+            await sleep(500);
+        }
+    }
+
+    await page
+        .evaluate(() => {
+            document
+                .querySelectorAll(
+                    "iframe[id*='google'], iframe[name*='google'], " +
+                        "#google_vignette, .adsbygoogle",
+                )
+                .forEach((element) => element.remove());
+        })
+        .catch(() => {});
+}
+
+// Click FamilyTreeNow's "Start Over" link to reset back to the search form.
+async function clickStartOver(page) {
+    const link = page
+        .getByRole("link", { name: /start over/i })
+        .first();
+
+    if (
+        (await link.count().catch(() => 0)) &&
+        (await link.isVisible().catch(() => false))
+    ) {
+        await link.click().catch(() => {});
+        await waitForPageSettled(page);
+        return true;
+    }
+
+    return false;
+}
+
+// Fallback for when a result has no usable detail href: click the View
+// Details link in-page. A programmatic element.click() bypasses Playwright's
+// actionability waits, which can hang for 30s on a churning results DOM.
+async function clickViewDetailsLink(page, targetHref) {
+    const previousUrl = page.url();
+
+    await Promise.all([
+        page
+            .waitForURL((url) => url.href !== previousUrl, {
+                timeout: 45_000,
+                waitUntil: "domcontentloaded",
+            })
+            .catch(() => {}),
+        page
+            .evaluate((href) => {
+                const links = Array.from(
+                    document.querySelectorAll("a[href]"),
+                ).filter(
+                    (el) =>
+                        el.classList?.contains("detail-link") ||
+                        /view details/i.test(el.textContent || ""),
+                );
+
+                const match = href
+                    ? links.find(
+                          (el) =>
+                              el.href === href ||
+                              el.href.split("#")[0] ===
+                                  href.split("#")[0],
+                      )
+                    : links[0];
+
+                match?.click();
+            }, targetHref)
+            .catch(() => {}),
+    ]);
+}
+
+// Navigate back to the search-results listing before falling back to an
+// in-page View Details click. When hunting across multiple candidates the
+// page may be sitting on a previous record's detail page, where the
+// detail-link click fallback would not find the right element.
+async function returnToResultsPage(page, resultsPageUrl) {
+    if (!resultsPageUrl) {
+        return;
+    }
+
+    const current = page.url().split("#")[0];
+    const target = resultsPageUrl.split("#")[0];
+
+    if (current === target) {
+        return;
+    }
+
+    await page
+        .goto(resultsPageUrl, {
+            waitUntil: "domcontentloaded",
+            timeout: 60_000,
+        })
+        .catch(() => {});
+    await waitForPageSettled(page);
+}
+
+// Open ONE specific result's detail page by navigating directly to its URL
+// (bypassing the View Details click / Google vignette interstitial). Solves
+// any Turnstile that the navigation trips and recovers from a vignette once.
+// Returns true when landed on a detail page, false when it could not get there
+// (so the caller can try the next candidate result).
+async function openResultDetail(
+    page,
+    result,
+    person,
+    city,
+    state,
+    resultsPageUrl,
+) {
+    await ensureCaptchaSolved(page);
+
+    console.log(
+        `🖱️ Opening detail page for ` +
+        `${result.resultName || person.fullName} — ` +
+        `${result.livesInCity}, ${result.livesInState}`,
+    );
+
+    // Navigate straight to the record URL instead of clicking the View
+    // Details button. This sidesteps the Google vignette interstitial in
+    // most cases and avoids locator clicks that can hang for 30s on a
+    // stale or vignetted results DOM. Resolve the href defensively and
+    // pass the results page as the referer so FTN sees a normal request.
+    const referer = resultsPageUrl || page.url();
+
+    const detailUrl =
+        result.href && isDetailUrl(result.href)
+            ? new URL(result.href, referer).href.split("#")[0]
+            : null;
+
+    if (detailUrl) {
+        const gotoOk = await page
+            .goto(detailUrl, {
+                waitUntil: "domcontentloaded",
+                timeout: 60_000,
+                referer,
+            })
+            .then(() => true)
+            .catch((error) => {
+                console.log(
+                    `⚠️ Direct navigation to detail URL failed ` +
+                    `(${error?.message || error}); ` +
+                    `falling back to in-page click.`,
+                );
+                return false;
+            });
+
+        if (!gotoOk) {
+            await returnToResultsPage(page, resultsPageUrl);
+            await clickViewDetailsLink(page, result.href);
+        }
+    } else {
+        await returnToResultsPage(page, resultsPageUrl);
+        await clickViewDetailsLink(page, result.href);
+    }
+
+    await waitForPageSettled(page);
+
+    // Direct navigation to a record URL can itself trip Turnstile and land
+    // on /InternalCaptcha. Solve it before deciding whether we reached a
+    // detail page or need vignette recovery.
+    await ensureCaptchaSolved(page);
+    await waitForPageSettled(page);
+
+    // Vignette recovery: if we still aren't on a detail URL, dismiss the ad
+    // and retry the direct navigation once.
+    if (!isDetailUrl(page.url())) {
+        console.log(
+            "⚠️ Not on a detail page (likely a Google vignette ad). " +
+            "Dismissing...",
+        );
+
+        await dismissVignette(page);
+
+        if (detailUrl) {
+            const retryOk = await page
+                .goto(detailUrl, {
+                    waitUntil: "domcontentloaded",
+                    timeout: 60_000,
+                    referer,
+                })
+                .then(() => true)
+                .catch((error) => {
+                    console.log(
+                        `⚠️ Retry navigation to detail URL failed ` +
+                        `(${error?.message || error}); ` +
+                        `falling back to in-page click.`,
+                    );
+                    return false;
+                });
+
+            if (!retryOk) {
+                await returnToResultsPage(page, resultsPageUrl);
+                await clickViewDetailsLink(page, result.href);
+            }
+        } else {
+            await returnToResultsPage(page, resultsPageUrl);
+            await clickViewDetailsLink(page, result.href);
+        }
+
+        await waitForPageSettled(page);
+        await ensureCaptchaSolved(page);
+        await waitForPageSettled(page);
+    }
+
+    if (!isDetailUrl(page.url())) {
+        // Still stuck. Reset to the search form and let the caller try the
+        // next candidate (or give up on this row).
+        await clickStartOver(page);
+        console.log(
+            `⚠️ Could not reach the detail page for ` +
+            `${result.resultName || person.fullName} ` +
+            `(vignette ad / still on results page).`,
+        );
+        return false;
+    }
+
+    console.log(`✅ Detail page opened: ${page.url()}`);
+
+    await ensureCaptchaSolved(page);
+
+    return true;
+}
+
+async function extractWirelessPhoneCandidates(page) {
+    // FTN loads the Phone Numbers section after the detail page settles.
+    // Wait briefly for a phone-shaped number to appear before scanning, so
+    // a late-rendering section isn't missed (and a true no-phone page fails
+    // fast through the catch).
+    await page
+        .waitForFunction(
+            () =>
+                /(?:\+?1[\s.\-]?)?\(?[2-9]\d{2}\)?[\s.\-]\d{3}[\s.\-]\d{4}/.test(
+                    document.body.innerText || "",
+                ),
+            { timeout: 5_000 },
+        )
+        .catch(() => {});
+
+    const candidates = await page.evaluate(() => {
+        const clean = (value) =>
+            String(value || "").replace(/\s+/g, " ").trim();
+
+        const phonePattern =
+            /(?:\+?1[\s.\-]?)?\(?[2-9]\d{2}\)?[\s.\-]\d{3}[\s.\-]\d{4}/g;
+
+        // FTN labels every number inline as "(817) 881-5823 - Wireless",
+        // "... - Landline", or "... - Voip". We inspect the text immediately
+        // AFTER each number and keep it only when its OWN label is wireless.
+        // Checking the whole container (old behavior) let a landline leak in
+        // whenever a wireless number sat in the same container/window.
+        const wirelessLabelPattern =
+            /\b(wireless|mobile|cellular|cell phone)\b/i;
+        const nonWirelessLabelPattern = /\b(landline|voip)\b/i;
+
+        const reportedPattern =
+            /last\s+reported\s+[A-Za-z]{3,9}\s+\d{4}/i;
+
+        const output = [];
+
+        const bodyText = document.body.innerText || "";
+
+        // Collect every phone-shaped match first so each number's label
+        // window can be bounded by the START of the next number. This
+        // prevents a landline (no label of its own) from being falsely
+        // kept by a neighboring wireless number's " - Wireless" label,
+        // which a fixed-width window can reach when numbers sit close.
+        const matches = [];
+        phonePattern.lastIndex = 0;
+        let m;
+        while ((m = phonePattern.exec(bodyText)) !== null) {
+            matches.push({
+                phone: m[0],
+                start: m.index,
+                end: m.index + m[0].length,
+            });
+        }
+
+        // Cap the label window so it captures " - Wireless" (even with
+        // extra spacing / a newline when the label is a sibling element)
+        // but never reads past the next number.
+        const MAX_LABEL_WINDOW = 22;
+
+        for (let i = 0; i < matches.length; i += 1) {
+            const { phone, start, end } = matches[i];
+
+            const nextStart =
+                i + 1 < matches.length
+                    ? matches[i + 1].start
+                    : bodyText.length;
+
+            const labelWindow = bodyText.slice(
+                end,
+                Math.min(nextStart, end + MAX_LABEL_WINDOW),
+            );
+
+            // Reject landlines/voip first (a number is one or the other).
+            if (nonWirelessLabelPattern.test(labelWindow)) {
+                continue;
+            }
+
+            // Keep only numbers whose own label is wireless/mobile/cellular.
+            if (!wirelessLabelPattern.test(labelWindow)) {
+                continue;
+            }
+
+            // Wider context for the "Last reported" date + diagnostics.
+            const winStart = Math.max(0, start - 60);
+            const winEnd = Math.min(bodyText.length, end + 120);
+            const context = clean(bodyText.slice(winStart, winEnd));
+
+            output.push({
+                phone,
+                context,
+                lastReported:
+                    context.match(reportedPattern)?.[0] || null,
+                source: "per-number-label",
+            });
+        }
+
+        return output;
+    });
+
+    const unique = new Map();
+
+    for (const candidate of candidates) {
+        const normalized = normalizePhone(candidate.phone);
+
+        if (!normalized) {
+            continue;
+        }
+
+        const reportedAt = parseReportedDate(
+            candidate.lastReported ||
+            candidate.context,
+        );
+
+        const existing = unique.get(normalized);
+
+        if (
+            !existing ||
+            (reportedAt || 0) > (existing.reportedAt || 0) ||
+            candidate.context.length < existing.context.length
+        ) {
+            unique.set(normalized, {
+                phone: normalized,
+                context: cleanText(candidate.context),
+                lastReported:
+                    candidate.lastReported || null,
+                reportedAt,
+            });
+        }
+    }
+
+    return [...unique.values()].sort((a, b) => {
+        const dateDifference =
+            (b.reportedAt || 0) - (a.reportedAt || 0);
+
+        if (dateDifference !== 0) {
+            return dateDifference;
+        }
+
+        return a.context.length - b.context.length;
+    });
+}
+
+// When a search returns 0 detail-link cards, dump a short page snapshot
+// so we can tell whether FTN genuinely had no match, returned a different
+// layout, or is silently showing an inline captcha.
+async function logZeroResultsDiagnostics(page, person) {
+    try {
+        const info = await page
+            .evaluate(() => {
+                const clean = (document.body.innerText || "")
+                    .replace(/\s+/g, " ")
+                    .trim();
+
+                const noResults = /(no\s+results|no\s+matching|did\s+not\s+match|0\s+results|no\s+records|no\s+people\s+found|we\s+couldn't\s+find)/i.test(
+                    clean,
+                );
+
+                const widgetPresent = !!document.querySelector(
+                    ".cf-turnstile, [data-sitekey], " +
+                        'iframe[src*="challenges.cloudflare.com"], ' +
+                        '[name="cf-turnstile-response"]',
+                );
+
+                return {
+                    url: location.href,
+                    snippet: clean.slice(0, 220),
+                    noResults,
+                    widgetPresent,
+                };
+            })
+            .catch(() => null);
+
+        if (!info) {
+            console.log(
+                `🔎 [diag] ${person.fullName}: could not read results page.`,
+            );
+            return;
+        }
+
+        console.log(
+            `🔎 [diag] ${person.fullName} returned 0 results ` +
+                `— url: ${info.url}`,
+        );
+        console.log(
+            `   turnstile widget present: ${info.widgetPresent} | ` +
+                `"no results" text: ${info.noResults}`,
+        );
+        console.log(`   page snippet: ${info.snippet}`);
+    } catch (error) {
+        console.log(
+            `🔎 [diag] results-page scan failed ` +
+                `(${error?.message || error}).`,
+        );
+    }
+}
+
+// When an opened detail page yields no wireless/mobile phone, list every
+// phone-shaped number on the page with its surrounding label context. This
+// reveals whether the person has a landline only, a mislabeled mobile, or
+// genuinely no number at all.
+async function logNoPhoneDiagnostics(page, person) {
+    try {
+        const info = await page
+            .evaluate(() => {
+                const phonePattern =
+                    /(?:\+?1[\s.\-]?)?\(?[2-9]\d{2}\)?[\s.\-]\d{3}[\s.\-]\d{4}/g;
+
+                const body = document.body.innerText || "";
+                const lines = body
+                    .split("\n")
+                    .map((line) => line.replace(/\s+/g, " ").trim())
+                    .filter(Boolean);
+
+                const found = [];
+
+                for (let i = 0; i < lines.length; i += 1) {
+                    phonePattern.lastIndex = 0;
+
+                    if (!phonePattern.test(lines[i])) {
+                        continue;
+                    }
+
+                    const context = lines
+                        .slice(Math.max(0, i - 1), Math.min(lines.length, i + 4))
+                        .join(" | ");
+
+                    found.push({
+                        line: lines[i],
+                        context: context.slice(0, 180),
+                    });
+
+                    if (found.length >= 8) {
+                        break;
+                    }
+                }
+
+                return {
+                    found,
+                    hasWirelessLabel: /\b(wireless|mobile|cellular|cell phone)\b/i.test(
+                        body,
+                    ),
+                    hasLandlineLabel: /\b(landline|land line|home phone)\b/i.test(
+                        body,
+                    ),
+                    snippet: body.replace(/\s+/g, " ").slice(0, 220),
+                };
+            })
+            .catch(() => null);
+
+        if (!info) {
+            console.log(
+                `🔎 [diag] ${person.fullName}: could not read detail page.`,
+            );
+            return;
+        }
+
+        console.log(
+            `🔎 [diag] ${person.fullName} detail page phone scan — ` +
+                `wireless label: ${info.hasWirelessLabel} | ` +
+                `landline label: ${info.hasLandlineLabel} | ` +
+                `numbers found: ${info.found.length}`,
+        );
+
+        for (const entry of info.found) {
+            console.log(`     • ${entry.line}  ⟵  ${entry.context}`);
+        }
+
+        console.log(`   page snippet: ${info.snippet}`);
+    } catch (error) {
+        console.log(
+            `🔎 [diag] detail-page scan failed ` +
+                `(${error?.message || error}).`,
+        );
+    }
+}
+
+async function enrichOneRow(page, row) {
+    const person = parseStrictTwoWordName(row.author);
+
+    if (!person) {
+        console.log(
+            `⏭️ ID ${row.id}: rejected non-strict name ` +
+            `"${row.author}".`,
+        );
+
+        return {
+            status: "invalid_name",
+        };
+    }
+
+    const city = cleanText(row.city);
+    const state = cleanText(row.state).toUpperCase();
+
+    if (!city || !/^[A-Z]{2}$/.test(state)) {
+        console.log(
+            `⏭️ ID ${row.id}: invalid city/state ` +
+            `"${row.city}, ${row.state}".`,
+        );
+
+        return {
+            status: "invalid_location",
+        };
+    }
+
+    // Rewrite subdivision/neighborhood names (e.g. "Stonebriar Village") to
+    // their real parent city before searching, so FTN's autocomplete can
+    // resolve them. See LOCATION_OVERRIDES — confirm mappings before relying.
+    const overrideCity = LOCATION_OVERRIDES[city.toLowerCase()];
+    const searchCity = overrideCity || city;
+
+    if (overrideCity) {
+        console.log(
+            `🔄 Location override: ${city}, ${state} → ${searchCity}, ${state}`,
+        );
+    }
+
+    console.log("");
+    console.log("============================================================");
+    console.log(
+        `🔎 ID ${row.id}: ${person.fullName} — ${city}, ${state}`,
+    );
+    console.log("============================================================");
+
+    await openFamilyTreeNow(page);
+
+    const {
+        cityStateInput,
+    } = await findSearchForm(page);
+
+    // Select the location FIRST. FamilyTreeNow rerenders the form when an
+    // autocomplete choice is selected, which was clearing Last name.
+    const selectedLocation =
+        await chooseExactCityStateSuggestion(
+            page,
+            cityStateInput,
+            searchCity,
+            state,
+        );
+
+    if (!selectedLocation) {
+        return {
+            status: "location_not_selected",
+        };
+    }
+
+    // Fill and verify both names only after the city autocomplete has
+    // finished and the form has stabilized.
+    await selectAndVerifyNamesAfterLocation(
+        page,
+        person.firstName,
+        person.lastName,
+        searchCity,
+        state,
+    );
+
+    await submitSearch(page);
+
+    // Searching can trip Cloudflare and redirect to /InternalCaptcha.
+    await ensureCaptchaSolved(page);
+
+    // Capture the search-results listing URL so we can pass it as the referer
+    // for every candidate's detail-page navigation and return here before any
+    // in-page View Details click fallback.
+    const resultsPageUrl = page.url();
+
+    const candidates = await chooseFamilyTreeNowResults(
+        page,
+        person,
+        searchCity,
+        state,
+    );
+
+    if (!candidates.length) {
+        return {
+            status: "no_matching_result",
+        };
+    }
+
+    // Try each qualifying result until one yields a wireless/mobile phone.
+    // This covers the case where the first exact match has no mobile number
+    // but a later exact match (same person) does.
+    const maxAttempts = Math.min(candidates.length, MAX_PHONE_ATTEMPTS);
+    let openedAny = false;
+
+    for (let i = 0; i < maxAttempts; i += 1) {
+        const candidate = candidates[i];
+        const attemptNum = i + 1;
+
+        let opened = false;
+        try {
+            opened = await openResultDetail(
+                page,
+                candidate,
+                person,
+                searchCity,
+                state,
+                resultsPageUrl,
+            );
+        } catch (error) {
+            console.log(
+                `⚠️ Opening result ${attemptNum}/${maxAttempts} failed ` +
+                `(${error?.message || error})${
+                    i < maxAttempts - 1 ? "; trying next." : "."
+                }`,
+            );
+        }
+
+        if (!opened) {
+            if (i < maxAttempts - 1) {
+                console.log(
+                    `ℹ️ Could not open result ${attemptNum}/${maxAttempts}; ` +
+                    `trying next candidate.`,
+                );
+            }
+            continue;
+        }
+
+        openedAny = true;
+
+        const wirelessPhones =
+            await extractWirelessPhoneCandidates(page);
+
+        if (wirelessPhones.length) {
+            const best = wirelessPhones[0];
+
+            const updated = await updateMobilePhone(
+                row.id,
+                best.phone,
+            );
+
+            if (!updated) {
+                console.log(
+                    `ℹ️ ID ${row.id} already had a mobile phone by update time.`,
+                );
+
+                return {
+                    status: "already_updated",
+                };
+            }
+
+            console.log(
+                `✅ ID ${row.id}: saved mobile_phone ${best.phone}` +
+                `${best.lastReported ? ` (${best.lastReported})` : ""}` +
+                `${attemptNum > 1 ? ` (result ${attemptNum})` : ""}`,
+            );
+
+            return {
+                status: "updated",
+                phone: best.phone,
+            };
+        }
+
+        console.log(
+            `ℹ️ No Wireless/Mobile phone on result ${attemptNum}/${maxAttempts}` +
+            ` for ${person.fullName}` +
+            `${i < maxAttempts - 1 ? "; trying next candidate." : "."}`,
+        );
+
+        await logNoPhoneDiagnostics(page, person);
+    }
+
+    if (!openedAny) {
+        // Couldn't open any candidate's detail page — likely a transient
+        // captcha/vignette. Mark failed so the row gets retried.
+        return {
+            status: "failed",
+        };
+    }
+
+    console.log(
+        `ℹ️ No Wireless/Mobile phone found for ` +
+        `${person.fullName} (tried ${maxAttempts} result(s)).`,
+    );
+
+    return {
+        status: "no_mobile_phone",
+    };
+}
+
+// -------------------- Smartproxy browser launch + warm-up --------------------
+
+async function warmUpProxy(page, workerIndex) {
+    if (!WARM_UP_ENABLED) {
+        return;
+    }
+
+    console.log(`🔥 Worker ${workerIndex}: warming up proxy...`);
+
+    try {
+        await page.goto("https://ipinfo.io/json", {
+            waitUntil: "domcontentloaded",
+            timeout: 60_000,
+        });
+        await sleep(2_000 + Math.random() * 2_000);
+        await page.mouse.wheel(0, 800).catch(() => {});
+        await sleep(1_000 + Math.random() * 1_000);
+
+        await page.goto("https://www.reebok.com/", {
+            waitUntil: "domcontentloaded",
+            timeout: 60_000,
+        });
+        await sleep(3_000 + Math.random() * 3_000);
+        await page.mouse.wheel(0, 1_200).catch(() => {});
+        await sleep(1_500 + Math.random() * 1_500);
+
+        console.log(`✅ Worker ${workerIndex}: warm-up complete`);
+    } catch (error) {
+        console.log(
+            `⚠️ Worker ${workerIndex}: warm-up failed: ${error.message}`,
+        );
+    }
+}
+
+// Launch one persistent Chrome context per worker, routed through its own
+// smartproxy IP. Mirrors the workerb.js setup (one proxy per worker, warm-up
+// on ipinfo + reebok). Rotate by closing the context and launching a fresh
+// one with the next proxy IP — never swap proxies on a live page.
+async function launchSmartProxyBrowser(workerIndex) {
+    const proxyIp =
+        process.env.FTN_PROXY_IP ||
+        PROXY_POOL[workerIndex % PROXY_POOL.length] ||
+        "";
+
+    if (!proxyIp) {
+        throw new Error(
+            `No proxy IP available for worker ${workerIndex}.`,
+        );
+    }
+
+    const userDataDir = path.join(
+        os.tmpdir(),
+        `ftn-worker-${workerIndex}-${Date.now()}`,
+    );
+
+    const proxy = {
+        server: `http://${proxyIp}:${PROXY_PORT}`,
+        username: PROXY_USER,
+        password: PROXY_PASS,
+    };
+
+    console.log(
+        `🌐 Worker ${workerIndex}: launching browser via proxy ` +
+        `${proxyIp}:${PROXY_PORT}`,
+    );
+
+    const context = await chromium.launchPersistentContext(userDataDir, {
+        channel: "chrome",
+        headless: false,
+        viewport: null,
+        proxy,
+        args: [
+            "--disable-blink-features=AutomationControlled",
+            "--no-first-run",
+            "--no-default-browser-check",
+            // Required when running as root inside a container (Railway/Docker):
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+        ],
+    });
+
+    const page = context.pages()[0] || (await context.newPage());
+    await page.bringToFront();
+
+    page.setDefaultTimeout(30_000);
+    page.setDefaultNavigationTimeout(60_000);
+
+    await page.addInitScript(TURNSTILE_INIT_SCRIPT);
+    await warmUpProxy(page, workerIndex);
+
+    return { context, page };
+}
+
+function chunkRoundRobin(items, k) {
+    const batches = Array.from({ length: k }, () => []);
+    items.forEach((item, i) => batches[i % k].push(item));
+    return batches;
+}
+
+// The per-worker row loop. Returns totals; does NOT close the browser or
+// the pool — the caller (runWorker) owns those.
+async function runEnrichmentLoop(page, rows, workerIndex) {
+    const totals = {
+        updated: 0,
+        invalid_name: 0,
+        invalid_location: 0,
+        location_not_selected: 0,
+        no_matching_result: 0,
+        no_mobile_phone: 0,
+        already_updated: 0,
+        failed: 0,
+    };
+
+    for (let index = 0; index < rows.length; index += 1) {
+        const row = rows[index];
+
+        console.log(
+            `\n[W${workerIndex} ${index + 1}/${rows.length}] ` +
+            `Processing database ID ${row.id}`,
+        );
+
+        let result = null;
+        let handled = false;
+
+        for (let attempt = 1; attempt <= 2; attempt += 1) {
+            try {
+                result = await enrichOneRow(page, row);
+                handled = true;
+                break;
+            } catch (error) {
+                console.error(
+                    `❌ ID ${row.id} failed ` +
+                    `(attempt ${attempt}/2): ${error.message}`,
+                );
+
+                const looksLikeCaptcha =
+                    /captcha|turnstile|verification|2captcha/i.test(
+                        error.message,
+                    );
+
+                if (looksLikeCaptcha && attempt === 1) {
+                    await ensureCaptchaSolved(page).catch(
+                        (e) => {
+                            console.error(
+                                `   retry clear-up failed: ${e.message}`,
+                            );
+                        },
+                    );
+                    continue;
+                }
+
+                totals.failed += 1;
+                break;
+            }
+        }
+
+        if (handled && result) {
+            totals[result.status] =
+                (totals[result.status] || 0) + 1;
+
+            // Phase 2: running success count to console (how many of how many
+            // succeeded so far for this worker). The grand total across all
+            // workers is logged by the master at the end (printGrandTotals).
+            if (result.status === "updated") {
+                console.log(
+                    `📊 Worker ${workerIndex}: ${totals.updated}/${rows.length} ` +
+                    `succeeded so far.`,
+                );
+            }
+        }
+
+        await sleep(randomDelay());
+    }
+
+    return totals;
+}
+
+function printWorkerTotals(totals, workerIndex) {
+    console.log("");
+    console.log(
+        "============================================================",
+    );
+    console.log(`✅ Worker ${workerIndex} finished.`);
+    console.log(`   Updated: ${totals.updated}`);
+    console.log(`   Invalid names skipped: ${totals.invalid_name}`);
+    console.log(
+        `   Invalid locations skipped: ${totals.invalid_location}`,
+    );
+    console.log(
+        `   Autocomplete location unavailable: ` +
+        `${totals.location_not_selected}`,
+    );
+    console.log(
+        `   No matching person result: ${totals.no_matching_result}`,
+    );
+    console.log(
+        `   No mobile phone found: ${totals.no_mobile_phone}`,
+    );
+    console.log(`   Failed: ${totals.failed}`);
+    console.log(
+        "============================================================",
+    );
+}
+
+// -------------------- WORKER --------------------
+async function runWorker() {
+    const workerIndex = Number(process.env.WORKER_INDEX || 0);
+    const batchFile = process.env.FTN_BATCH_FILE;
+
+    let rows = [];
+
+    if (batchFile) {
+        rows = JSON.parse(
+            await fs.promises
+                .readFile(batchFile, "utf8")
+                .catch(() => "[]"),
+        );
+    }
+
+    console.log(
+        `🧵 Worker ${workerIndex} starting ` +
+        `(${rows.length} row(s), mode ${BROWSER_MODE}).`,
+    );
+
+    let context;
+    let page;
+
+    try {
+        if (BROWSER_MODE === "multilogin") {
+            if (!process.env.MULTILOGIN_WS) {
+                throw new Error("MULTILOGIN_WS is missing.");
+            }
+
+            const browser = await chromium.connectOverCDP(
+                process.env.MULTILOGIN_WS,
+            );
+            context = browser.contexts()[0];
+
+            if (!context) {
+                throw new Error(
+                    "No Multilogin browser context found.",
+                );
+            }
+
+            page = await context.newPage();
+            page.setDefaultTimeout(30_000);
+            page.setDefaultNavigationTimeout(60_000);
+            await page.addInitScript(TURNSTILE_INIT_SCRIPT);
+        } else {
+            ({ context, page } =
+                await launchSmartProxyBrowser(workerIndex));
+        }
+
+        const totals = await runEnrichmentLoop(
+            page,
+            rows,
+            workerIndex,
+        );
+        printWorkerTotals(totals, workerIndex);
+
+        // Report totals back to the master process (if IPC is available) so
+        // the master can print a grand success count across all workers.
+        if (typeof process.send === "function") {
+            process.send({
+                type: "totals",
+                workerIndex,
+                rowsProcessed: rows.length,
+                totals,
+            });
+        }
+    } finally {
+        await page?.close().catch(() => {});
+
+        // Only the smartproxy context is ours to close; Multilogin owns its.
+        if (BROWSER_MODE !== "multilogin") {
+            await context?.close().catch(() => {});
+        }
+
+        await pool.end().catch(() => {});
+    }
+}
+
+// -------------------- MASTER --------------------
+async function runMaster() {
+    console.log(
+        "📱 FamilyTreeNow General Contracting Enrichment (master) Started",
+    );
+    console.log(
+        `🧱 Build: RESULT_CITY_MATCH_V7 · workers: ${WORKER_COUNT} · ` +
+        `mode: ${BROWSER_MODE}`,
+    );
+
+    if (BROWSER_MODE !== "multilogin" && PROXY_POOL.length === 0) {
+        throw new Error(
+            "No proxies configured. Set FTN_PROXIES or use " +
+            "FTN_BROWSER_MODE=multilogin.",
+        );
+    }
+
+    const rows = await getRowsToEnrich();
+
+    console.log(
+        `📋 Loaded ${rows.length} row(s) with no mobile_phone.`,
+    );
+
+    if (!rows.length) {
+        await pool.end().catch(() => {});
+        return;
+    }
+
+    const batches = chunkRoundRobin(rows, WORKER_COUNT);
+    const batchFiles = [];
+
+    for (let i = 0; i < WORKER_COUNT; i += 1) {
+        const file = path.join(
+            os.tmpdir(),
+            `ftn-batch-${i}-${Date.now()}.json`,
+        );
+        await fs.promises.writeFile(
+            file,
+            JSON.stringify(batches[i] || []),
+        );
+        batchFiles.push(file);
+
+        console.log(
+            `📦 Worker ${i} → ${batches[i]?.length || 0} row(s) ` +
+            `(proxy ${PROXY_POOL[i % PROXY_POOL.length] || "n/a"})`,
+        );
+    }
+
+    const exitCodes = [];
+    const workers = [];
+    const workerReports = [];
+
+    for (let i = 0; i < WORKER_COUNT; i += 1) {
+        const proxyIp = PROXY_POOL[i % PROXY_POOL.length] || "";
+
+        const child = fork(__filename, [], {
+            env: {
+                ...process.env,
+                FTN_WORKER: "1",
+                WORKER_INDEX: String(i),
+                FTN_BATCH_FILE: batchFiles[i],
+                FTN_PROXY_IP: proxyIp,
+            },
+            stdio: ["ignore", "pipe", "pipe", "ipc"],
+        });
+
+        const prefix = `🧵 W${i}`;
+        child.stdout.on("data", (buf) =>
+            console.log(`${prefix}: ${String(buf).trimEnd()}`),
+        );
+        child.stderr.on("data", (buf) =>
+            console.error(`${prefix} ❗ ${String(buf).trimEnd()}`),
+        );
+
+        child.on("message", (msg) => {
+            if (msg && msg.type === "totals") {
+                workerReports.push(msg);
+            }
+        });
+
+        workers.push(
+            new Promise((resolve) => {
+                child.on("exit", (code) => {
+                    exitCodes.push(code);
+                    resolve(code);
+                });
+            }),
+        );
+    }
+
+    await Promise.all(workers);
+
+    await Promise.all(
+        batchFiles.map((f) =>
+            fs.promises.unlink(f).catch(() => {}),
+        ),
+    );
+
+    console.log(
+        `🏁 All workers finished. Exit codes: ` +
+        `${exitCodes.join(", ")}`,
+    );
+
+    printGrandTotals(workerReports, rows.length);
+
+    await pool.end().catch(() => {});
+}
+
+// Aggregate per-worker totals into a grand success count and log it.
+function printGrandTotals(reports, totalRowsLoaded) {
+    if (!reports.length) {
+        return;
+    }
+
+    const grand = {
+        updated: 0,
+        invalid_name: 0,
+        invalid_location: 0,
+        location_not_selected: 0,
+        no_matching_result: 0,
+        no_mobile_phone: 0,
+        already_updated: 0,
+        failed: 0,
+    };
+
+    let rowsProcessed = 0;
+
+    for (const report of reports) {
+        rowsProcessed += report.rowsProcessed || 0;
+
+        for (const key of Object.keys(grand)) {
+            grand[key] += (report.totals?.[key] || 0);
+        }
+    }
+
+    const total = totalRowsLoaded || rowsProcessed;
+    const phones = grand.updated;
+    const pct = total ? Math.round((phones / total) * 100) : 0;
+
+    console.log("");
+    console.log(
+        "============================================================",
+    );
+    console.log(
+        `🎯 Success: ${phones} / ${total} rows enriched ` +
+        `with a mobile phone (${pct}%).`,
+    );
+    console.log("   Mobile phones saved: " + grand.updated);
+    console.log(
+        "   No matching person result: " + grand.no_matching_result,
+    );
+    console.log(
+        "   No mobile phone found: " + grand.no_mobile_phone,
+    );
+    console.log("   Already updated: " + grand.already_updated);
+    console.log("   Invalid names skipped: " + grand.invalid_name);
+    console.log(
+        "   Invalid locations skipped: " + grand.invalid_location,
+    );
+    console.log("   Failed: " + grand.failed);
+    console.log(
+        "============================================================",
+    );
+}
+
+if (require.main === module) {
+    if (process.env.FTN_WORKER === "1") {
+        runWorker().catch(async (error) => {
+            console.error(`❌ Worker fatal: ${error.message}`);
+            await pool.end().catch(() => {});
+            process.exit(1);
+        });
+    } else {
+        runMaster().catch(async (error) => {
+            console.error("❌ Master fatal:", error.message);
+            await pool.end().catch(() => {});
+            process.exit(1);
+        });
+    }
+}
