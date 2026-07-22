@@ -126,7 +126,7 @@ const ALLOWED_NORMALIZED = new Map(
 
 const SYSTEM_PROMPT = `You classify Nextdoor neighborhood posts for a general-contractor lead pipeline.
 
-A post is a LEAD (is_lead=true) ONLY when the AUTHOR is a homeowner/property owner SEEKING TO HIRE someone for a service ON their home or property: general-contracting (deck, fence, remodel, addition, roofing, siding, restoration, foundation, garage), home trades (plumbing, electrical, HVAC, gutters, windows, doors, drywall, tile, painting, lighting, generator), or home maintenance (lawn/yard, landscaping, house cleaning, handyman, pest control, junk removal, pool, power washing, christmas lights).
+A post is a LEAD (is_lead=true) ONLY when the AUTHOR is a homeowner/property owner SEEKING TO HIRE someone for a service ON their home or property: general-contracting (deck, fence, remodel, addition, roofing, siding, restoration, foundation, garage), home trades (plumbing, electrical, HVAC, gutters, windows, doors, drywall, tile, painting, lighting, generator), or home maintenance (lawn/yard, landscaping, house cleaning, handyman, pest control, junk removal, pool, power washing, exterior lighting, christmas lights ) insurance ( they are in search of either home insurance or auto insurance or filing an insurance claim) realtor (They are looking to move or sell their house or are someone in search of renting or buying a house) 
 NOT a lead when the author is advertising their own services, posting spam/duplicates, only recommending a pro they already used, says the job is done, is not a home service, is off-topic, is venting/asking with no intent to hire, or is about moving.
 
 lead_type is an ARRAY of one or more atomic trade values describing what the post is about, chosen from this list:
