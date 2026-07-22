@@ -2912,16 +2912,34 @@ async function extractWirelessPhoneCandidates(page) {
             }
 
             // Wider context for the "Last reported" date + diagnostics.
-            const winStart = Math.max(0, start - 60);
-            const winEnd = Math.min(bodyText.length, end + 120);
-            const context = clean(bodyText.slice(winStart, winEnd));
+            // Keep this phone's details bounded by the beginning of the next
+// phone number. This prevents dates from neighboring columns or
+// rows from being assigned to the wrong phone.
+            const phoneRecordText = clean(
+                bodyText.slice(
+                    start,
+                    Math.min(
+                        nextStart,
+                        start + 500,
+                    ),
+                ),
+            );
+
+            const lastReported =
+                phoneRecordText.match(reportedPattern)?.[0] ||
+                null;
+
+            const possiblePrimary =
+                /possible\s+primary\s+phone/i.test(
+                    phoneRecordText,
+                );
 
             output.push({
                 phone,
-                context,
-                lastReported:
-                    context.match(reportedPattern)?.[0] || null,
-                source: "per-number-label",
+                context: phoneRecordText,
+                lastReported,
+                possiblePrimary,
+                source: "bounded-phone-record",
             });
         }
 
@@ -2944,10 +2962,17 @@ async function extractWirelessPhoneCandidates(page) {
 
         const existing = unique.get(normalized);
 
+        const candidateDate = reportedAt || 0;
+        const existingDate = existing?.reportedAt || 0;
+
         if (
             !existing ||
-            (reportedAt || 0) > (existing.reportedAt || 0) ||
-            candidate.context.length < existing.context.length
+            candidateDate > existingDate ||
+            (
+                candidateDate === existingDate &&
+                candidate.context.length <
+                existing.context.length
+            )
         ) {
             unique.set(normalized, {
                 phone: normalized,
@@ -2955,16 +2980,26 @@ async function extractWirelessPhoneCandidates(page) {
                 lastReported:
                     candidate.lastReported || null,
                 reportedAt,
+                possiblePrimary:
+                    Boolean(candidate.possiblePrimary),
             });
         }
     }
 
     return [...unique.values()].sort((a, b) => {
         const dateDifference =
-            (b.reportedAt || 0) - (a.reportedAt || 0);
+            (b.reportedAt || 0) -
+            (a.reportedAt || 0);
 
         if (dateDifference !== 0) {
             return dateDifference;
+        }
+
+        if (
+            Boolean(a.possiblePrimary) !==
+            Boolean(b.possiblePrimary)
+        ) {
+            return a.possiblePrimary ? -1 : 1;
         }
 
         return a.context.length - b.context.length;
