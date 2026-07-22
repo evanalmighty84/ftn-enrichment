@@ -99,6 +99,7 @@ RUN npx --yes playwright-core install chromium || \
 # ----------------------------------------------------------------------------
 # Copy the enrichment script and Railway entrypoint
 # ----------------------------------------------------------------------------
+COPY pre_enrichment.js ./
 COPY ftn_enrichment.js ./
 COPY ftn-trigger-server.js ./
 COPY railway-entrypoint-ftn.sh ./

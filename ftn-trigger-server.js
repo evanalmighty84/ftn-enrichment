@@ -8,13 +8,17 @@ const { spawn } = require("child_process");
 const PORT = Number(process.env.PORT || 8080);
 const HOST = "::";
 
-let enrichmentProcess = null;
+const PRE_ENRICHMENT_SCRIPT = "/app/pre_enrichment.js";
+const FTN_ENRICHMENT_SCRIPT = "/app/ftn_enrichment.js";
+
+let workflowProcess = null;
+let workflowStage = null;
 
 function isRunning() {
     return (
-        enrichmentProcess &&
-        enrichmentProcess.exitCode === null &&
-        !enrichmentProcess.killed
+        workflowProcess &&
+        workflowProcess.exitCode === null &&
+        !workflowProcess.killed
     );
 }
 
@@ -24,6 +28,131 @@ function sendJson(res, statusCode, body) {
     });
 
     res.end(JSON.stringify(body));
+}
+
+function runFtnEnrichment() {
+    console.log("✅ Preliminary script completed successfully.");
+    console.log("▶️ Starting ftn_enrichment.js...");
+
+    workflowStage = "ftn_enrichment";
+
+    const child = spawn(
+        process.execPath,
+        [FTN_ENRICHMENT_SCRIPT],
+        {
+            cwd: "/app",
+            env: process.env,
+            stdio: "inherit",
+        },
+    );
+
+    workflowProcess = child;
+
+    let failedToStart = false;
+
+    child.once("error", (error) => {
+        failedToStart = true;
+
+        console.error(
+            `❌ FTN enrichment failed to start: ${error.message}`,
+        );
+
+        if (workflowProcess === child) {
+            workflowProcess = null;
+            workflowStage = null;
+        }
+    });
+
+    child.once("exit", (code, signal) => {
+        if (failedToStart) {
+            return;
+        }
+
+        if (signal) {
+            console.error(
+                `❌ FTN enrichment stopped by signal ${signal}.`,
+            );
+        } else if (code === 0) {
+            console.log(
+                "✅ FTN enrichment completed successfully.",
+            );
+        } else {
+            console.error(
+                `❌ FTN enrichment exited with code ${code}.`,
+            );
+        }
+
+        if (workflowProcess === child) {
+            workflowProcess = null;
+            workflowStage = null;
+        }
+    });
+}
+
+function startWorkflow() {
+    console.log("▶️ Starting preliminary enrichment script...");
+
+    workflowStage = "pre_enrichment";
+
+    const child = spawn(
+        process.execPath,
+        [PRE_ENRICHMENT_SCRIPT],
+        {
+            cwd: "/app",
+            env: process.env,
+            stdio: "inherit",
+        },
+    );
+
+    workflowProcess = child;
+
+    let failedToStart = false;
+
+    child.once("error", (error) => {
+        failedToStart = true;
+
+        console.error(
+            `❌ Preliminary script failed to start: ${error.message}`,
+        );
+
+        if (workflowProcess === child) {
+            workflowProcess = null;
+            workflowStage = null;
+        }
+    });
+
+    child.once("exit", (code, signal) => {
+        if (failedToStart) {
+            return;
+        }
+
+        if (workflowProcess === child) {
+            workflowProcess = null;
+        }
+
+        if (signal) {
+            console.error(
+                `❌ Preliminary script stopped by signal ${signal}.`,
+            );
+
+            workflowStage = null;
+            return;
+        }
+
+        if (code !== 0) {
+            console.error(
+                `❌ Preliminary script exited with code ${code}. ` +
+                "FTN enrichment will not run.",
+            );
+
+            workflowStage = null;
+            return;
+        }
+
+        runFtnEnrichment();
+    });
+
+    return child.pid;
 }
 
 const server = http.createServer((req, res) => {
@@ -37,7 +166,8 @@ const server = http.createServer((req, res) => {
             success: true,
             service: "ftn-enrichment",
             running: isRunning(),
-            pid: enrichmentProcess?.pid || null,
+            stage: workflowStage,
+            pid: workflowProcess?.pid || null,
         });
 
         return;
@@ -57,54 +187,22 @@ const server = http.createServer((req, res) => {
     if (isRunning()) {
         sendJson(res, 409, {
             success: false,
-            message: "FTN enrichment is already running",
-            pid: enrichmentProcess.pid,
+            message: "The FTN workflow is already running.",
+            stage: workflowStage,
+            pid: workflowProcess.pid,
         });
 
         return;
     }
 
-    console.log("🚀 Starting ftn_enrichment.js...");
-
-    enrichmentProcess = spawn(
-        process.execPath,
-        ["/app/ftn_enrichment.js"],
-        {
-            cwd: "/app",
-            env: process.env,
-            stdio: "inherit",
-        },
-    );
-
-    const pid = enrichmentProcess.pid;
-
-    enrichmentProcess.once("error", (error) => {
-        console.error(
-            `❌ FTN enrichment failed to start: ${error.message}`,
-        );
-
-        enrichmentProcess = null;
-    });
-
-    enrichmentProcess.once("exit", (code, signal) => {
-        if (signal) {
-            console.log(
-                `⚠️ FTN enrichment stopped by signal ${signal}`,
-            );
-        } else if (code === 0) {
-            console.log("✅ FTN enrichment completed successfully");
-        } else {
-            console.error(
-                `❌ FTN enrichment exited with code ${code}`,
-            );
-        }
-
-        enrichmentProcess = null;
-    });
+    const pid = startWorkflow();
 
     sendJson(res, 202, {
         success: true,
-        message: "FTN enrichment started",
+        message:
+            "The preliminary script was started. " +
+            "FTN enrichment will run after it completes.",
+        stage: workflowStage,
         pid,
     });
 });
