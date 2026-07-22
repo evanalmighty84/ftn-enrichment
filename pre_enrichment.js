@@ -1,4 +1,38 @@
-const pool = require('../db/db');
+const { Pool } = require("pg");
+
+function buildPool() {
+    const connectionString =
+        process.env.DATABASE_URL ||
+        (
+            process.env.DB_USER &&
+            process.env.DB_HOST &&
+            process.env.DB_NAME
+                ? `postgres://${encodeURIComponent(
+                    process.env.DB_USER,
+                )}:${encodeURIComponent(
+                    process.env.DB_PASSWORD || "",
+                )}@${process.env.DB_HOST}:${
+                    process.env.DB_PORT || 5432
+                }/${encodeURIComponent(process.env.DB_NAME)}`
+                : null
+        );
+
+    if (!connectionString) {
+        throw new Error(
+            "No Postgres connection configured. Set DATABASE_URL or " +
+            "DB_USER/DB_HOST/DB_NAME/DB_PASSWORD/DB_PORT.",
+        );
+    }
+
+    return new Pool({
+        connectionString,
+        ssl: {
+            rejectUnauthorized: false,
+        },
+    });
+}
+
+const pool = buildPool();
 
 /* ---------------- Perplexity Sonar config ---------------- */
 const PPLX_API_URL =

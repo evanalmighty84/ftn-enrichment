@@ -213,6 +213,6 @@ log "  proxy pool: ${FTN_PROXIES:-207.228.202.97,207.228.200.57,107.158.19.135}"
 
 cd "$(dirname "$0")"
 
-log "exec node ftn_enrichment.js"
+log "exec node ftn-trigger-server.js"
 echo "🌐 Starting FTN trigger server..."
 exec node /app/ftn-trigger-server.js
