@@ -21,6 +21,8 @@ const DEFAULT_SOURCE_TABLE =
 
 const MAX_REQUEST_BODY_BYTES = 100_000;
 
+const workflowQueue = [];
+
 let workflowProcess = null;
 let workflowStage = null;
 let workflowSourceTable = null;
@@ -136,6 +138,108 @@ function sendJson(res, statusCode, body) {
     res.end(payload);
 }
 
+function getQueueSnapshot() {
+    return workflowQueue.map((item, index) => ({
+        position: index + 1,
+        source_table: item.sourceTable,
+        queued_at: item.queuedAt,
+    }));
+}
+
+function getQueuedPosition(sourceTable) {
+    const index = workflowQueue.findIndex(
+        (item) => item.sourceTable === sourceTable,
+    );
+
+    return index === -1 ? null : index + 1;
+}
+
+function enqueueWorkflow(sourceTable) {
+    if (
+        isRunning() &&
+        workflowSourceTable === sourceTable
+    ) {
+        return {
+            status: "already_running",
+            position: 0,
+        };
+    }
+
+    const existingPosition =
+        getQueuedPosition(sourceTable);
+
+    if (existingPosition !== null) {
+        return {
+            status: "already_queued",
+            position: existingPosition,
+        };
+    }
+
+    workflowQueue.push({
+        sourceTable,
+        queuedAt: new Date().toISOString(),
+    });
+
+    console.log(
+        `📥 Queued ${sourceTable} at position ` +
+        `${workflowQueue.length}.`,
+    );
+
+    return {
+        status: "queued",
+        position: workflowQueue.length,
+    };
+}
+
+function startNextQueuedWorkflow() {
+    if (isRunning()) {
+        return;
+    }
+
+    const next = workflowQueue.shift();
+
+    if (!next) {
+        console.log("📭 FTN workflow queue is empty.");
+        return;
+    }
+
+    console.log(
+        `📤 Starting queued workflow for ` +
+        `${next.sourceTable}.`,
+    );
+
+    try {
+        startWorkflow(next.sourceTable);
+    } catch (error) {
+        console.error(
+            `❌ Could not start queued workflow for ` +
+            `${next.sourceTable}: ${error.message}`,
+        );
+
+        workflowProcess = null;
+        workflowStage = null;
+        workflowSourceTable = null;
+
+        setImmediate(startNextQueuedWorkflow);
+    }
+}
+
+function finishWorkflowAndContinue(child = null) {
+    if (
+        child &&
+        workflowProcess &&
+        workflowProcess !== child
+    ) {
+        return;
+    }
+
+    workflowProcess = null;
+    workflowStage = null;
+    workflowSourceTable = null;
+
+    setImmediate(startNextQueuedWorkflow);
+}
+
 function clearWorkflowState(child) {
     if (workflowProcess !== child) {
         return;
@@ -186,7 +290,7 @@ function runFtnEnrichment(sourceTable) {
             `${error.message}`,
         );
 
-        clearWorkflowState(child);
+        finishWorkflowAndContinue(child);
     });
 
     child.once("exit", (code, signal) => {
@@ -211,7 +315,7 @@ function runFtnEnrichment(sourceTable) {
             );
         }
 
-        clearWorkflowState(child);
+        finishWorkflowAndContinue(child);
     });
 }
 
@@ -267,8 +371,7 @@ function startWorkflow(sourceTable) {
                 `${signal}.`,
             );
 
-            workflowStage = null;
-            workflowSourceTable = null;
+            finishWorkflowAndContinue();
             return;
         }
 
@@ -278,12 +381,20 @@ function startWorkflow(sourceTable) {
                 `${code}. FTN enrichment will not run.`,
             );
 
-            workflowStage = null;
-            workflowSourceTable = null;
+            finishWorkflowAndContinue();
             return;
         }
 
-        runFtnEnrichment(sourceTable);
+        try {
+            runFtnEnrichment(sourceTable);
+        } catch (error) {
+            console.error(
+                `❌ Could not start FTN enrichment for ` +
+                `${sourceTable}: ${error.message}`,
+            );
+
+            finishWorkflowAndContinue();
+        }
     });
 
     return child.pid;
@@ -321,6 +432,8 @@ const server = http.createServer(
                 stage: workflowStage,
                 source_table: workflowSourceTable,
                 pid: workflowProcess?.pid || null,
+                queue_length: workflowQueue.length,
+                queue: getQueueSnapshot(),
                 allowed_source_tables: [
                     ...ALLOWED_SOURCE_TABLES,
                 ],
@@ -373,14 +486,70 @@ const server = http.createServer(
         }
 
         if (isRunning()) {
-            sendJson(res, 409, {
-                success: false,
+            const queueResult =
+                enqueueWorkflow(sourceTable);
+
+            if (
+                queueResult.status ===
+                "already_running"
+            ) {
+                sendJson(res, 202, {
+                    success: true,
+                    status: "already_running",
+                    message:
+                        "A workflow for this source table " +
+                        "is already running.",
+                    stage: workflowStage,
+                    source_table:
+                    workflowSourceTable,
+                    pid:
+                        workflowProcess?.pid || null,
+                    queue_length:
+                    workflowQueue.length,
+                    queue: getQueueSnapshot(),
+                });
+
+                return;
+            }
+
+            if (
+                queueResult.status ===
+                "already_queued"
+            ) {
+                sendJson(res, 202, {
+                    success: true,
+                    status: "already_queued",
+                    message:
+                        "A workflow for this source table " +
+                        "is already queued.",
+                    source_table: sourceTable,
+                    queue_position:
+                    queueResult.position,
+                    active_source_table:
+                    workflowSourceTable,
+                    queue_length:
+                    workflowQueue.length,
+                    queue: getQueueSnapshot(),
+                });
+
+                return;
+            }
+
+            sendJson(res, 202, {
+                success: true,
+                status: "queued",
                 message:
-                    "The FTN workflow is already running.",
-                stage: workflowStage,
-                source_table: workflowSourceTable,
-                requested_source_table: sourceTable,
-                pid: workflowProcess.pid,
+                    "The FTN workflow is busy. This " +
+                    "source table was added to the queue.",
+                source_table: sourceTable,
+                queue_position:
+                queueResult.position,
+                active_source_table:
+                workflowSourceTable,
+                active_stage: workflowStage,
+                queue_length:
+                workflowQueue.length,
+                queue: getQueueSnapshot(),
             });
 
             return;
@@ -412,12 +581,14 @@ const server = http.createServer(
 
         sendJson(res, 202, {
             success: true,
+            status: "started",
             message:
                 "The preliminary script was started. " +
                 "FTN enrichment will run after it completes.",
             stage: workflowStage,
             source_table: sourceTable,
             pid,
+            queue_length: workflowQueue.length,
         });
     },
 );
@@ -445,5 +616,8 @@ server.listen(PORT, HOST, () => {
     console.log(
         "   Allowed source tables: " +
         [...ALLOWED_SOURCE_TABLES].join(", "),
+    );
+    console.log(
+        "   Queue mode: FIFO; duplicate table requests are deduplicated",
     );
 });
