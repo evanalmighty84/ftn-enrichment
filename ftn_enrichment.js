@@ -38,10 +38,16 @@ const { Pool } = require("pg");
 function buildPool() {
     const connectionString =
         process.env.DATABASE_URL ||
-        (process.env.DB_USER && process.env.DB_HOST && process.env.DB_NAME
-            ? `postgres://${encodeURIComponent(process.env.DB_USER)}:${encodeURIComponent(
+        (process.env.DB_USER &&
+        process.env.DB_HOST &&
+        process.env.DB_NAME
+            ? `postgres://${encodeURIComponent(
+                process.env.DB_USER,
+            )}:${encodeURIComponent(
                 process.env.DB_PASSWORD || "",
-            )}@${process.env.DB_HOST}:${process.env.DB_PORT || 5432}/${encodeURIComponent(
+            )}@${process.env.DB_HOST}:${
+                process.env.DB_PORT || 5432
+            }/${encodeURIComponent(
                 process.env.DB_NAME,
             )}`
             : null);
@@ -61,8 +67,27 @@ function buildPool() {
 
 const pool = buildPool();
 
-const TABLE_NAME = "unfiltered_general_contracting";
-const FTN_HOME_URL = "https://www.familytreenow.com/";
+const ALLOWED_SOURCE_TABLES = new Set([
+    "unfiltered_general_contracting",
+    "unfiltered_ins_mold_pest_housecl_plumb_paint_land_lawn_handy",
+]);
+
+const REQUESTED_SOURCE_TABLE =
+    process.env.FTN_SOURCE_TABLE ||
+    "unfiltered_general_contracting";
+
+if (!ALLOWED_SOURCE_TABLES.has(REQUESTED_SOURCE_TABLE)) {
+    throw new Error(
+        `Invalid FTN source table: ${REQUESTED_SOURCE_TABLE}`,
+    );
+}
+
+const TABLE_NAME = REQUESTED_SOURCE_TABLE;
+
+console.log(`🗃️ FTN source table: ${TABLE_NAME}`);
+
+const FTN_HOME_URL =
+    "https://www.familytreenow.com/";
 
 const MAX_ROWS = Number(process.env.FTN_MAX_ROWS || 50);
 
