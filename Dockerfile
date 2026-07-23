@@ -103,6 +103,11 @@ COPY pre_enrichment.js ./
 COPY ftn_enrichment.js ./
 COPY ftn-trigger-server.js ./
 COPY railway-entrypoint-ftn.sh ./
+COPY mckinney_neighborhoods_polygons.json ./
+
+RUN test -f /app/mckinney_neighborhoods_polygons.json \
+    && echo "Polygon file copied successfully" \
+    && ls -lh /app/mckinney_neighborhoods_polygons.json
 
 RUN chmod +x /app/railway-entrypoint-ftn.sh
 
