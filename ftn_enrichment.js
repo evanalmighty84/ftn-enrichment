@@ -532,51 +532,129 @@ function randomDelay() {
  *   Leah R.
  *   Patrick S.
  */
-function parseStrictTwoWordName(author = "") {
-    const clean = cleanText(author).normalize("NFC");
-    const parts = clean.split(" ");
+function parsePersonName(author = "") {
+    let clean = cleanText(author)
+        .normalize("NFC")
+        .replace(/\s+/g, " ")
+        .trim();
 
-    if (parts.length !== 2) {
+    if (!clean) {
         return null;
     }
 
-    const [firstName, lastName] = parts;
-
-    const validNamePart =
-        /^\p{L}[\p{L}''\-]*$/u;
-
+    // Reject couples, combined profiles, and obvious non-person formats.
     if (
-        !validNamePart.test(firstName) ||
-        !validNamePart.test(lastName)
+        /[&/]/.test(clean) ||
+        /(?:^|\s)(?:and|or)(?:\s|$)/i.test(clean)
     ) {
         return null;
     }
+
+    let parts = clean.split(" ");
+
+    // Remove common suffixes before determining the surname.
+    const suffixPattern =
+        /^(?:jr|sr|ii|iii|iv)\.?$/i;
+
+    if (
+        parts.length > 2 &&
+        suffixPattern.test(parts[parts.length - 1])
+    ) {
+        parts = parts.slice(0, -1);
+    }
+
+    // Accept first + last, middle names, middle initials,
+    // and multi-part surnames.
+    if (parts.length < 2 || parts.length > 5) {
+        return null;
+    }
+
+    const fullNamePart =
+        /^\p{L}[\p{L}'’\-]*$/u;
+
+    const middleInitial =
+        /^\p{L}\.?$/u;
+
+    for (let index = 0; index < parts.length; index += 1) {
+        const part = parts[index];
+        const isMiddle =
+            index > 0 &&
+            index < parts.length - 1;
+
+        if (
+            !fullNamePart.test(part) &&
+            !(isMiddle && middleInitial.test(part))
+        ) {
+            return null;
+        }
+    }
+
+    const firstName = parts[0];
+    const finalLastName =
+        parts[parts.length - 1];
 
     const firstLetterCount =
         firstName.match(/\p{L}/gu)?.length || 0;
 
     const lastLetterCount =
-        lastName.match(/\p{L}/gu)?.length || 0;
+        finalLastName.match(/\p{L}/gu)?.length || 0;
 
-    if (firstLetterCount < 2 || lastLetterCount < 4) {
+    // Two-letter surnames such as Li, Wu, Ng, or Yu are valid.
+    if (
+        firstLetterCount < 2 ||
+        lastLetterCount < 2
+    ) {
         return null;
     }
 
-    const capFirst = capitalizeName(firstName);
-    const capLastFull = capitalizeName(lastName);
+    const formattedParts = parts.map(
+        (part, index) => {
+            if (
+                index > 0 &&
+                index < parts.length - 1 &&
+                /^\p{L}\.?$/u.test(part)
+            ) {
+                return part
+                    .replace(".", "")
+                    .toUpperCase();
+            }
 
-    // For hyphenated last names, search using only the final segment (e.g.
-    // "Partlow-Shelton" -> "Shelton") so FTN's name search/autocomplete
-    // matches reliably. The full name is retained on `fullName` for result
-    // matching and logging.
-    const searchLastName = capLastFull.includes("-")
-        ? capitalizeName(lastName.split("-").pop())
-        : capLastFull;
+            return capitalizeName(part);
+        },
+    );
+
+    const formattedFirstName =
+        formattedParts[0];
+
+    const formattedFullName =
+        formattedParts.join(" ");
+
+    let searchLastName =
+        formattedParts[
+        formattedParts.length - 1
+            ];
+
+    // Keep the existing hyphenated-name behavior.
+    if (searchLastName.includes("-")) {
+        searchLastName =
+            capitalizeName(
+                searchLastName
+                    .split("-")
+                    .pop(),
+            );
+    }
 
     return {
-        firstName: capFirst,
+        firstName: formattedFirstName,
+
+        // Search FTN using the final surname segment:
+        // Mark Van Wagoner -> Wagoner
+        // David De Leon -> Leon
+        // Diana D’Andrea Bruce -> Bruce
         lastName: searchLastName,
-        fullName: `${capFirst} ${capLastFull}`,
+
+        // Retain the complete name for matching and storage.
+        fullName: formattedFullName,
     };
 }
 
@@ -3488,7 +3566,7 @@ async function logNoPhoneDiagnostics(page, person) {
 }
 
 async function enrichOneRow(page, row) {
-    const person = parseStrictTwoWordName(row.author);
+    const person = parsePersonName(row.author);
 
     if (!person) {
         console.log(
