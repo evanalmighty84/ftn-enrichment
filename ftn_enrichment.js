@@ -143,7 +143,7 @@ const MAX_PHONE_ATTEMPTS = Number(
 // Mirrors your workerb.js setup: one proxy IP per worker.
 // Override with FTN_PROXIES (comma-separated) in .env.
 const PROXY_POOL = (process.env.FTN_PROXIES ||
-    "207.228.202.97,207.228.200.57,107.158.19.135")
+    "207.228.203.235,204.77.128.10,107.158.18.161")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
