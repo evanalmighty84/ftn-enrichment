@@ -21,18 +21,63 @@ const DEFAULT_SOURCE_TABLE =
 
 const MAX_REQUEST_BODY_BYTES = 100_000;
 
+function positiveIntegerFromEnv(name, fallback) {
+    const value = Number(process.env[name]);
+
+    return Number.isFinite(value) && value > 0
+        ? Math.floor(value)
+        : fallback;
+}
+
+// The preliminary classifier should normally finish quickly.
+const PRE_ENRICHMENT_TIMEOUT_MS = positiveIntegerFromEnv(
+    "PRE_ENRICHMENT_TIMEOUT_MS",
+    10 * 60 * 1000,
+);
+
+// The FTN browser workers may need longer, but they may not run forever.
+const FTN_ENRICHMENT_TIMEOUT_MS = positiveIntegerFromEnv(
+    "FTN_ENRICHMENT_TIMEOUT_MS",
+    30 * 60 * 1000,
+);
+
+// Give Chromium/Node a chance to shut down cleanly before SIGKILL.
+const CHILD_TERMINATION_GRACE_MS = positiveIntegerFromEnv(
+    "FTN_CHILD_TERMINATION_GRACE_MS",
+    15_000,
+);
+
+// Last-resort queue release if the operating system never emits child "exit".
+const CHILD_FORCE_RELEASE_MS = positiveIntegerFromEnv(
+    "FTN_CHILD_FORCE_RELEASE_MS",
+    5_000,
+);
+
 const workflowQueue = [];
 
 let workflowProcess = null;
 let workflowStage = null;
 let workflowSourceTable = null;
+let workflowStartedAt = null;
+let workflowDeadlineAt = null;
+let workflowTimedOut = false;
+let workflowTimeoutHandle = null;
+let workflowKillHandle = null;
+let workflowReleaseHandle = null;
+let shuttingDown = false;
 
 function isRunning() {
     return Boolean(
         workflowProcess &&
         workflowProcess.exitCode === null &&
-        !workflowProcess.killed,
+        workflowProcess.signalCode === null,
     );
+}
+
+function getStageTimeoutMs(stage) {
+    return stage === "pre_enrichment"
+        ? PRE_ENRICHMENT_TIMEOUT_MS
+        : FTN_ENRICHMENT_TIMEOUT_MS;
 }
 
 function resolveSourceTable(value) {
@@ -191,8 +236,92 @@ function enqueueWorkflow(sourceTable) {
     };
 }
 
+function clearTimer(handle) {
+    if (handle) {
+        clearTimeout(handle);
+    }
+}
+
+function clearWorkflowTimers(child = null) {
+    if (
+        child &&
+        workflowProcess &&
+        workflowProcess !== child
+    ) {
+        return;
+    }
+
+    clearTimer(workflowTimeoutHandle);
+    clearTimer(workflowKillHandle);
+    clearTimer(workflowReleaseHandle);
+
+    workflowTimeoutHandle = null;
+    workflowKillHandle = null;
+    workflowReleaseHandle = null;
+}
+
+function clearWorkflowState(child = null) {
+    if (
+        child &&
+        workflowProcess &&
+        workflowProcess !== child
+    ) {
+        return false;
+    }
+
+    clearWorkflowTimers(child);
+
+    workflowProcess = null;
+    workflowStage = null;
+    workflowSourceTable = null;
+    workflowStartedAt = null;
+    workflowDeadlineAt = null;
+    workflowTimedOut = false;
+
+    return true;
+}
+
+function terminateChildTree(child, signal) {
+    if (
+        !child ||
+        !child.pid ||
+        child.exitCode !== null ||
+        child.signalCode !== null
+    ) {
+        return;
+    }
+
+    try {
+        // Each workflow child is spawned as a Linux process-group leader.
+        // Negative PID therefore signals the Node parent plus Chromium workers.
+        if (process.platform !== "win32") {
+            process.kill(-child.pid, signal);
+        } else {
+            child.kill(signal);
+        }
+    } catch (error) {
+        if (error?.code !== "ESRCH") {
+            console.warn(
+                `⚠️ Could not send ${signal} to process group ` +
+                `${child.pid}: ${error.message}`,
+            );
+        }
+
+        try {
+            child.kill(signal);
+        } catch (fallbackError) {
+            if (fallbackError?.code !== "ESRCH") {
+                console.warn(
+                    `⚠️ Could not send ${signal} to child ` +
+                    `${child.pid}: ${fallbackError.message}`,
+                );
+            }
+        }
+    }
+}
+
 function startNextQueuedWorkflow() {
-    if (isRunning()) {
+    if (shuttingDown || isRunning()) {
         return;
     }
 
@@ -216,180 +345,205 @@ function startNextQueuedWorkflow() {
             `${next.sourceTable}: ${error.message}`,
         );
 
-        workflowProcess = null;
-        workflowStage = null;
-        workflowSourceTable = null;
-
+        clearWorkflowState();
         setImmediate(startNextQueuedWorkflow);
     }
 }
 
 function finishWorkflowAndContinue(child = null) {
-    if (
-        child &&
-        workflowProcess &&
-        workflowProcess !== child
-    ) {
+    if (!clearWorkflowState(child)) {
         return;
     }
 
-    workflowProcess = null;
-    workflowStage = null;
-    workflowSourceTable = null;
-
-    setImmediate(startNextQueuedWorkflow);
-}
-
-function clearWorkflowState(child) {
-    if (workflowProcess !== child) {
-        return;
+    if (!shuttingDown) {
+        setImmediate(startNextQueuedWorkflow);
     }
-
-    workflowProcess = null;
-    workflowStage = null;
-    workflowSourceTable = null;
 }
 
-function createChildEnvironment(sourceTable) {
-    return {
-        ...process.env,
-        FTN_SOURCE_TABLE: sourceTable,
-    };
+function armWorkflowTimeout(
+    child,
+    stage,
+    sourceTable,
+    timeoutMs,
+) {
+    workflowStartedAt = new Date().toISOString();
+    workflowDeadlineAt = new Date(
+        Date.now() + timeoutMs,
+    ).toISOString();
+    workflowTimedOut = false;
+
+    console.log(
+        `⏱️ ${stage} timeout armed for ` +
+        `${Math.round(timeoutMs / 60_000)} minute(s) ` +
+        `(deadline ${workflowDeadlineAt}).`,
+    );
+
+    workflowTimeoutHandle = setTimeout(() => {
+        if (
+            workflowProcess !== child ||
+            !isRunning()
+        ) {
+            return;
+        }
+
+        workflowTimedOut = true;
+
+        console.error(
+            `⏰ ${stage} timed out after ${timeoutMs}ms ` +
+            `for ${sourceTable}. Sending SIGTERM to ` +
+            `process group ${child.pid}.`,
+        );
+
+        terminateChildTree(child, "SIGTERM");
+
+        workflowKillHandle = setTimeout(() => {
+            if (
+                workflowProcess !== child ||
+                child.exitCode !== null ||
+                child.signalCode !== null
+            ) {
+                return;
+            }
+
+            console.error(
+                `🧨 ${stage} did not stop within ` +
+                `${CHILD_TERMINATION_GRACE_MS}ms. ` +
+                `Sending SIGKILL to process group ${child.pid}.`,
+            );
+
+            terminateChildTree(child, "SIGKILL");
+
+            workflowReleaseHandle = setTimeout(() => {
+                if (workflowProcess !== child) {
+                    return;
+                }
+
+                console.error(
+                    `⚠️ No child exit event arrived after SIGKILL. ` +
+                    `Releasing the workflow slot so the FIFO queue ` +
+                    `can continue.`,
+                );
+
+                finishWorkflowAndContinue(child);
+            }, CHILD_FORCE_RELEASE_MS);
+        }, CHILD_TERMINATION_GRACE_MS);
+    }, timeoutMs);
 }
 
-function runFtnEnrichment(sourceTable) {
-    console.log(
-        "✅ Preliminary script completed successfully.",
-    );
-    console.log(
-        `▶️ Starting ftn_enrichment.js for ${sourceTable}...`,
-    );
-
-    workflowStage = "ftn_enrichment";
+function spawnWorkflowStage({
+                                sourceTable,
+                                stage,
+                                scriptPath,
+                                successMessage,
+                                onSuccess = null,
+                            }) {
+    workflowStage = stage;
     workflowSourceTable = sourceTable;
 
     const child = spawn(
         process.execPath,
-        [FTN_ENRICHMENT_SCRIPT],
+        [scriptPath],
         {
             cwd: "/app",
-            env: createChildEnvironment(sourceTable),
+            env: {
+                ...process.env,
+                FTN_SOURCE_TABLE: sourceTable,
+            },
             stdio: "inherit",
+
+            // Linux: make the child a process-group leader so a timeout can
+            // terminate the worker parent and every Chromium/worker descendant.
+            detached: process.platform !== "win32",
         },
     );
 
     workflowProcess = child;
+
+    const timeoutMs = getStageTimeoutMs(stage);
+
+    armWorkflowTimeout(
+        child,
+        stage,
+        sourceTable,
+        timeoutMs,
+    );
 
     let failedToStart = false;
 
     child.once("error", (error) => {
         failedToStart = true;
 
+        if (workflowProcess !== child) {
+            return;
+        }
+
         console.error(
-            `❌ FTN enrichment failed to start: ` +
-            `${error.message}`,
+            `❌ ${stage} failed to start for ` +
+            `${sourceTable}: ${error.message}`,
         );
 
         finishWorkflowAndContinue(child);
     });
 
     child.once("exit", (code, signal) => {
-        if (failedToStart) {
+        if (
+            failedToStart ||
+            workflowProcess !== child
+        ) {
+            return;
+        }
+
+        const timedOut = workflowTimedOut;
+
+        clearWorkflowTimers(child);
+
+        if (timedOut) {
+            console.error(
+                `⏰ ${stage} was terminated after exceeding ` +
+                `its ${timeoutMs}ms timeout for ${sourceTable}.`,
+            );
+
+            finishWorkflowAndContinue(child);
             return;
         }
 
         if (signal) {
             console.error(
-                `❌ FTN enrichment stopped by signal ` +
-                `${signal}.`,
-            );
-        } else if (code === 0) {
-            console.log(
-                `✅ FTN enrichment completed successfully ` +
+                `❌ ${stage} stopped by signal ${signal} ` +
                 `for ${sourceTable}.`,
             );
-        } else {
-            console.error(
-                `❌ FTN enrichment exited with code ` +
-                `${code} for ${sourceTable}.`,
-            );
-        }
 
-        finishWorkflowAndContinue(child);
-    });
-}
-
-function startWorkflow(sourceTable) {
-    console.log(
-        `🗃️ Requested source table: ${sourceTable}`,
-    );
-    console.log(
-        `▶️ Starting pre_enrichment.js for ` +
-        `${sourceTable}...`,
-    );
-
-    workflowStage = "pre_enrichment";
-    workflowSourceTable = sourceTable;
-
-    const child = spawn(
-        process.execPath,
-        [PRE_ENRICHMENT_SCRIPT],
-        {
-            cwd: "/app",
-            env: createChildEnvironment(sourceTable),
-            stdio: "inherit",
-        },
-    );
-
-    workflowProcess = child;
-
-    let failedToStart = false;
-
-    child.once("error", (error) => {
-        failedToStart = true;
-
-        console.error(
-            `❌ Preliminary script failed to start: ` +
-            `${error.message}`,
-        );
-
-        clearWorkflowState(child);
-    });
-
-    child.once("exit", (code, signal) => {
-        if (failedToStart) {
-            return;
-        }
-
-        if (workflowProcess === child) {
-            workflowProcess = null;
-        }
-
-        if (signal) {
-            console.error(
-                `❌ Preliminary script stopped by signal ` +
-                `${signal}.`,
-            );
-
-            finishWorkflowAndContinue();
+            finishWorkflowAndContinue(child);
             return;
         }
 
         if (code !== 0) {
             console.error(
-                `❌ Preliminary script exited with code ` +
-                `${code}. FTN enrichment will not run.`,
+                `❌ ${stage} exited with code ${code} ` +
+                `for ${sourceTable}.`,
             );
 
-            finishWorkflowAndContinue();
+            finishWorkflowAndContinue(child);
+            return;
+        }
+
+        console.log(successMessage);
+
+        if (!onSuccess) {
+            finishWorkflowAndContinue(child);
+            return;
+        }
+
+        // Release the completed preliminary child before starting FTN.
+        if (!clearWorkflowState(child)) {
             return;
         }
 
         try {
-            runFtnEnrichment(sourceTable);
+            onSuccess();
         } catch (error) {
             console.error(
-                `❌ Could not start FTN enrichment for ` +
+                `❌ Could not start the next stage for ` +
                 `${sourceTable}: ${error.message}`,
             );
 
@@ -398,6 +552,41 @@ function startWorkflow(sourceTable) {
     });
 
     return child.pid;
+}
+
+function runFtnEnrichment(sourceTable) {
+    console.log(
+        `▶️ Starting ftn_enrichment.js for ${sourceTable}...`,
+    );
+
+    return spawnWorkflowStage({
+        sourceTable,
+        stage: "ftn_enrichment",
+        scriptPath: FTN_ENRICHMENT_SCRIPT,
+        successMessage:
+            `✅ FTN enrichment completed successfully ` +
+            `for ${sourceTable}.`,
+    });
+}
+
+function startWorkflow(sourceTable) {
+    console.log(
+        `🗃️ Requested source table: ${sourceTable}`,
+    );
+
+    console.log(
+        `▶️ Starting pre_enrichment.js for ` +
+        `${sourceTable}...`,
+    );
+
+    return spawnWorkflowStage({
+        sourceTable,
+        stage: "pre_enrichment",
+        scriptPath: PRE_ENRICHMENT_SCRIPT,
+        successMessage:
+            "✅ Preliminary script completed successfully.",
+        onSuccess: () => runFtnEnrichment(sourceTable),
+    });
 }
 
 const server = http.createServer(
@@ -414,6 +603,7 @@ const server = http.createServer(
                 success: false,
                 error: "Invalid request URL.",
             });
+
             return;
         }
 
@@ -425,6 +615,14 @@ const server = http.createServer(
             req.method === "GET" &&
             url.pathname === "/health"
         ) {
+            const elapsedMs = workflowStartedAt
+                ? Math.max(
+                    0,
+                    Date.now() -
+                    Date.parse(workflowStartedAt),
+                )
+                : null;
+
             sendJson(res, 200, {
                 success: true,
                 service: "ftn-enrichment",
@@ -432,11 +630,29 @@ const server = http.createServer(
                 stage: workflowStage,
                 source_table: workflowSourceTable,
                 pid: workflowProcess?.pid || null,
+                started_at: workflowStartedAt,
+                deadline_at: workflowDeadlineAt,
+                elapsed_ms: elapsedMs,
+                timed_out: workflowTimedOut,
+                stage_timeout_ms:
+                    workflowStage
+                        ? getStageTimeoutMs(workflowStage)
+                        : null,
                 queue_length: workflowQueue.length,
                 queue: getQueueSnapshot(),
                 allowed_source_tables: [
                     ...ALLOWED_SOURCE_TABLES,
                 ],
+                timeout_configuration: {
+                    pre_enrichment_timeout_ms:
+                    PRE_ENRICHMENT_TIMEOUT_MS,
+                    ftn_enrichment_timeout_ms:
+                    FTN_ENRICHMENT_TIMEOUT_MS,
+                    child_termination_grace_ms:
+                    CHILD_TERMINATION_GRACE_MS,
+                    child_force_release_ms:
+                    CHILD_FORCE_RELEASE_MS,
+                },
             });
 
             return;
@@ -504,6 +720,8 @@ const server = http.createServer(
                     workflowSourceTable,
                     pid:
                         workflowProcess?.pid || null,
+                    started_at: workflowStartedAt,
+                    deadline_at: workflowDeadlineAt,
                     queue_length:
                     workflowQueue.length,
                     queue: getQueueSnapshot(),
@@ -527,6 +745,9 @@ const server = http.createServer(
                     queueResult.position,
                     active_source_table:
                     workflowSourceTable,
+                    active_stage: workflowStage,
+                    active_deadline_at:
+                    workflowDeadlineAt,
                     queue_length:
                     workflowQueue.length,
                     queue: getQueueSnapshot(),
@@ -547,6 +768,8 @@ const server = http.createServer(
                 active_source_table:
                 workflowSourceTable,
                 active_stage: workflowStage,
+                active_deadline_at:
+                workflowDeadlineAt,
                 queue_length:
                 workflowQueue.length,
                 queue: getQueueSnapshot(),
@@ -560,9 +783,7 @@ const server = http.createServer(
         try {
             pid = startWorkflow(sourceTable);
         } catch (error) {
-            workflowProcess = null;
-            workflowStage = null;
-            workflowSourceTable = null;
+            clearWorkflowState();
 
             console.error(
                 `❌ Could not start FTN workflow: ` +
@@ -588,6 +809,8 @@ const server = http.createServer(
             stage: workflowStage,
             source_table: sourceTable,
             pid,
+            started_at: workflowStartedAt,
+            deadline_at: workflowDeadlineAt,
             queue_length: workflowQueue.length,
         });
     },
@@ -606,18 +829,71 @@ server.on("clientError", (error, socket) => {
     }
 });
 
+function shutdown(signal) {
+    if (shuttingDown) {
+        return;
+    }
+
+    shuttingDown = true;
+
+    console.log(
+        `🛑 Received ${signal}; shutting down FTN server.`,
+    );
+
+    server.close(() => {
+        console.log("✅ FTN HTTP server closed.");
+    });
+
+    const child = workflowProcess;
+
+    if (child && isRunning()) {
+        console.log(
+            `🛑 Stopping active ${workflowStage} process group ` +
+            `${child.pid} before server exit.`,
+        );
+
+        terminateChildTree(child, "SIGTERM");
+
+        setTimeout(() => {
+            if (
+                workflowProcess === child &&
+                child.exitCode === null &&
+                child.signalCode === null
+            ) {
+                terminateChildTree(child, "SIGKILL");
+            }
+        }, CHILD_TERMINATION_GRACE_MS).unref();
+    }
+
+    setTimeout(() => {
+        process.exit(0);
+    }, CHILD_TERMINATION_GRACE_MS + 5_000).unref();
+}
+
+process.once("SIGTERM", () => shutdown("SIGTERM"));
+process.once("SIGINT", () => shutdown("SIGINT"));
+
 server.listen(PORT, HOST, () => {
     console.log(
         `✅ FTN trigger server listening on ` +
         `[${HOST}]:${PORT}`,
     );
+
     console.log("   POST /run");
     console.log("   GET  /health");
+
     console.log(
         "   Allowed source tables: " +
         [...ALLOWED_SOURCE_TABLES].join(", "),
     );
+
     console.log(
         "   Queue mode: FIFO; duplicate table requests are deduplicated",
+    );
+
+    console.log(
+        `   Timeouts: pre=${PRE_ENRICHMENT_TIMEOUT_MS}ms, ` +
+        `ftn=${FTN_ENRICHMENT_TIMEOUT_MS}ms, ` +
+        `grace=${CHILD_TERMINATION_GRACE_MS}ms`,
     );
 });
