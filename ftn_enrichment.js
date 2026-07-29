@@ -3134,9 +3134,23 @@ async function openResultDetail(
         return false;
     }
 
-    console.log(`[OK] Detail page opened: ${page.url()}`);
+    console.log(`✅ Detail page opened: ${page.url()}`);
 
     await ensureCaptchaSolved(page);
+
+    await page
+        .waitForFunction(
+            () =>
+                document.body &&
+                typeof document.body.innerText === "string" &&
+                document.body.innerText.trim().length > 0,
+            { timeout: 30_000 },
+        )
+        .catch(() => {
+            console.warn(
+                "⚠️ Detail page body was not fully readable before phone extraction.",
+            );
+        });
 
     return true;
 }
@@ -3150,7 +3164,7 @@ async function extractWirelessPhoneCandidates(page) {
         .waitForFunction(
             () =>
                 /(?:\+?1[\s.\-]?)?\(?[2-9]\d{2}\)?[\s.\-]\d{3}[\s.\-]\d{4}/.test(
-                    document.body.innerText || "",
+                    document.body?.innerText || "",
                 ),
             { timeout: 5_000 },
         )
@@ -3177,7 +3191,7 @@ async function extractWirelessPhoneCandidates(page) {
 
         const output = [];
 
-        const bodyText = document.body.innerText || "";
+        document.body?.innerText || ""
 
         // Collect every phone-shaped match first so each number's label
         // window can be bounded by the START of the next number. This
@@ -3349,7 +3363,7 @@ async function extractAnyPhoneCandidates(page) {
             /last\s+reported\s+[A-Za-z]{3,9}\s+\d{4}/i;
 
         const output = [];
-        const bodyText = document.body.innerText || "";
+        const bodyText = document.body?.innerText || "";
 
         const matches = [];
         phonePattern.lastIndex = 0;
