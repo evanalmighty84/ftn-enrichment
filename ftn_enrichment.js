@@ -3191,7 +3191,7 @@ async function extractWirelessPhoneCandidates(page) {
 
         const output = [];
 
-        document.body?.innerText || ""
+        const bodyText = document.body?.innerText || "";
 
         // Collect every phone-shaped match first so each number's label
         // window can be bounded by the START of the next number. This
