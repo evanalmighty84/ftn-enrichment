@@ -215,4 +215,21 @@ cd "$(dirname "$0")"
 
 log "exec node ftn-trigger-server.js"
 echo "🌐 Starting FTN trigger server..."
+
+
+(
+    while true; do
+        sleep 10
+
+        if ! kill -0 "$XVFB_PID" 2>/dev/null; then
+            log "ERROR: Xvfb process $XVFB_PID died."
+            log "Stopping trigger server so Railway restarts the container."
+
+            kill -TERM "$$" 2>/dev/null || true
+            exit 1
+        fi
+    done
+) &
+
+XVFB_WATCHDOG_PID=$!
 exec node /app/ftn-trigger-server.js
