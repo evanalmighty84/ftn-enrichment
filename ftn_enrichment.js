@@ -102,6 +102,11 @@ const FTN_HOME_URL =
 
 const MAX_ROWS = Number(process.env.FTN_MAX_ROWS || 50);
 
+const MINUTES_BACK = Number.parseInt(
+    process.env.MINUTES_BACK || "3480",
+    10,
+);
+
 // Contractor routing proximity threshold (miles). Distinct from the FTN
 // nearby-result tier (FTN_NEARBY_CITY_MILES, default 35): this one governs how
 // close a contractor's subscribed_areas city must be to the lead's resolved
@@ -705,18 +710,20 @@ async function getRowsToEnrich() {
                 state,
                 lead_type
             FROM ${TABLE_NAME}
-            WHERE is_lead = true
+            WHERE is_lead = TRUE
               AND ftn_enriched_at IS NULL
               AND author IS NOT NULL
               AND city IS NOT NULL
               AND state IS NOT NULL
+              AND timestamp >= NOW() - ($2::integer * INTERVAL '1 minute')
             ORDER BY id DESC
                 LIMIT $1
         `,
-        [MAX_ROWS],
+        [MAX_ROWS, MINUTES_BACK],
     );
 
     return rows;
+
 }
 
 // Mark a lead as processed by Phase 2 so it is never re-picked. Writes the
