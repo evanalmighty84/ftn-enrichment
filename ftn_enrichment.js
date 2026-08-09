@@ -101,11 +101,11 @@ const FTN_HOME_URL =
     "https://www.familytreenow.com/";
 
 const MAX_ROWS = Number(process.env.FTN_MAX_ROWS || 50);
-
 const MINUTES_BACK = Number.parseInt(
     process.env.MINUTES_BACK || "3480",
     10,
 );
+
 
 // Contractor routing proximity threshold (miles). Distinct from the FTN
 // nearby-result tier (FTN_NEARBY_CITY_MILES, default 35): this one governs how
@@ -381,86 +381,124 @@ function loadNeighborhoodPolygonIndex() {
     return NEIGHBORHOOD_POLYGON_INDEX;
 }
 
-function findNeighborhoodPolygon(locationName, state) {
+function findNeighborhoodPolygonCandidates(locationName, state) {
     const index = loadNeighborhoodPolygonIndex();
     const key = normalizeNeighborhoodKey(locationName);
 
     if (!index || !key) {
-        return null;
+        return [];
     }
 
     const expectedState = cleanText(state).toUpperCase();
     const candidates = index.get(key) || [];
+
     const stateCandidates = expectedState
         ? candidates.filter(
             (candidate) =>
-                !candidate.state || candidate.state === expectedState,
+                !candidate.state ||
+                candidate.state === expectedState,
         )
         : candidates;
 
-    const usable = stateCandidates.filter((candidate) => candidate.city);
+    const usable = stateCandidates.filter(
+        (candidate) => candidate.city,
+    );
 
     if (!usable.length) {
-        return null;
+        return [];
     }
 
+    /*
+     * A neighborhood name may exist under multiple parent cities.
+     * Example:
+     *
+     * Parkdale -> Dallas, TX
+     * Parkdale -> Plano, TX
+     *
+     * Return one candidate per distinct parent city instead of
+     * refusing to resolve the neighborhood.
+     */
     const uniqueCities = new Map();
 
     for (const candidate of usable) {
-        const cityKey = normalizeNeighborhoodKey(candidate.city);
+        const cityKey =
+            normalizeNeighborhoodKey(candidate.city);
 
-        if (cityKey && !uniqueCities.has(cityKey)) {
-            uniqueCities.set(cityKey, candidate);
+        const stateKey =
+            cleanText(
+                candidate.state || expectedState,
+            ).toUpperCase();
+
+        const uniqueKey = `${cityKey}|${stateKey}`;
+
+        if (
+            cityKey &&
+            !uniqueCities.has(uniqueKey)
+        ) {
+            uniqueCities.set(uniqueKey, candidate);
         }
     }
 
-    if (uniqueCities.size === 1) {
-        return [...uniqueCities.values()][0];
-    }
-
-    // If a key is ambiguous, prefer the record whose parent city is already
-    // the supplied value. Otherwise do not guess.
-    const sameCity = usable.find(
-        (candidate) =>
-            normalizeNeighborhoodKey(candidate.city) === key,
-    );
-
-    return sameCity || null;
+    return [...uniqueCities.values()];
 }
 
-function resolveSearchLocation(city, state) {
+function resolveSearchLocations(city, state) {
     const originalCity = cleanText(city);
-    const originalState = cleanText(state).toUpperCase();
-    const polygon = findNeighborhoodPolygon(originalCity, originalState);
+    const originalState =
+        cleanText(state).toUpperCase();
 
-    if (polygon?.city) {
-        return {
-            city: polygon.city,
-            state: polygon.state || originalState,
+    const polygonCandidates =
+        findNeighborhoodPolygonCandidates(
+            originalCity,
+            originalState,
+        );
+
+    if (polygonCandidates.length) {
+        return polygonCandidates.map((candidate) => ({
+            city: cleanText(candidate.city),
+            state:
+                cleanText(
+                    candidate.state || originalState,
+                ).toUpperCase(),
             source: "polygon",
             neighborhood:
-                polygon.name || polygon.shortName || originalCity,
-        };
+                candidate.name ||
+                candidate.shortName ||
+                originalCity,
+            neighborhoodId:
+                candidate.neighborhoodId ?? null,
+            slug: candidate.slug || null,
+        }));
     }
 
     const overrideCity =
-        LOCATION_OVERRIDES[originalCity.toLowerCase()];
+        LOCATION_OVERRIDES[
+            originalCity.toLowerCase()
+            ];
 
     if (overrideCity) {
-        return {
-            city: overrideCity,
-            state: originalState,
-            source: "override",
-            neighborhood: originalCity,
-        };
+        return [
+            {
+                city: overrideCity,
+                state: originalState,
+                source: "override",
+                neighborhood: originalCity,
+                neighborhoodId: null,
+                slug: null,
+            },
+        ];
     }
 
-    return {
-        city: originalCity,
-        state: originalState,
-        source: "original",
-        neighborhood: originalCity,
-    };
+    return [
+        {
+            city: originalCity,
+            state: originalState,
+            source: "original",
+            neighborhood: originalCity,
+            neighborhoodId: null,
+            slug: null,
+        },
+    ];
 }
 
 // Title-case a name for searching: capitalize the first letter and any letter
@@ -2278,15 +2316,8 @@ async function getFamilyTreeNowResults(page, person, city, state) {
             const clean = (value) =>
                 String(value || "").replace(/\s+/g, " ").trim();
 
-            const links = Array.from(
-                document.querySelectorAll(
-                    "a.detail-link[href], a[data-perma-link][href], " +
-                    "a[href*='/record/'], a[href*='/search/people/']",
-                ),
-            ).filter((element) => {
-                // Skip hidden/template duplicate links so dedupe-by-href
-                // keeps the visible card, not a stale hidden copy.
-                if (!element.getClientRects().length) {
+            const isVisible = (element) => {
+                if (!element || !element.getClientRects().length) {
                     return false;
                 }
 
@@ -2297,31 +2328,68 @@ async function getFamilyTreeNowResults(page, person, city, state) {
                     style.visibility !== "hidden" &&
                     parseFloat(style.opacity) !== 0
                 );
-            });
+            };
+
+            // Prefer the actual visible View Details links. FamilyTreeNow also
+            // renders name links and hidden/template links that can cause the
+            // same person card to be counted twice or the entire result panel
+            // to be treated as one giant card.
+            let links = Array.from(
+                document.querySelectorAll(
+                    "a.detail-link[href], a[data-perma-link][href]",
+                ),
+            ).filter(
+                (element) =>
+                    isVisible(element) &&
+                    (/view details/i.test(element.textContent || "") ||
+                        element.classList.contains("detail-link")),
+            );
+
+            // Layout fallback for pages where the detail-link class is absent.
+            if (!links.length) {
+                links = Array.from(
+                    document.querySelectorAll(
+                        "a[href*='/record/'], a[href*='/search/people/']",
+                    ),
+                ).filter(isVisible);
+            }
 
             return links.map((element) => {
                 let current = element;
+                let bestCard = null;
 
-                for (let depth = 0; depth < 12 && current; depth += 1) {
+                for (let depth = 0; depth < 10 && current; depth += 1) {
                     const text = clean(
                         current.innerText || current.textContent,
                     );
 
-                    if (
-                        /\bNAME:/i.test(text) &&
-                        /\bLIVES\s+IN:/i.test(text)
-                    ) {
-                        return { href: element.href, text };
+                    const nameCount =
+                        (text.match(/\bNAME:/gi) || []).length;
+                    const livesInCount =
+                        (text.match(/\bLIVES\s+IN:/gi) || []).length;
+
+                    // The smallest useful individual record container has one
+                    // NAME and one LIVES IN label. Once an ancestor contains
+                    // multiple labels, we have climbed into the parent panel
+                    // that contains multiple people and must stop.
+                    if (nameCount === 1 && livesInCount === 1) {
+                        bestCard = current;
+                    }
+
+                    if (nameCount > 1 || livesInCount > 1) {
+                        break;
                     }
 
                     current = current.parentElement;
                 }
 
                 const fallback =
+                    bestCard ||
                     element.closest(
-                        "tr, article, .row, .card, " +
-                        "[class*='record'], [class*='result']",
-                    ) || element.parentElement;
+                        "article, .card, [class*='person'], " +
+                        "[class*='record-item'], [class*='result-item']",
+                    ) ||
+                    element.parentElement;
 
                 return {
                     href: element.href,
@@ -2333,35 +2401,57 @@ async function getFamilyTreeNowResults(page, person, city, state) {
         })
         .catch(() => []);
 
+    console.log(
+        `[DEBUG] Found ${cards.length} raw FTN result card link(s).`,
+    );
+
+    cards.forEach((card, index) => {
+        console.log(
+            `[DEBUG] Raw card ${index + 1}: ` +
+            `${cleanText(card.text).slice(0, 300)}`,
+        );
+    });
+
     const results = [];
     const seenHrefs = new Set();
 
-    // Dedupe by the per-card `smck` token, preferring the link that carries
-    // `rid=` (the real "View Details" detail-page link) over the card's name
-    // link (which points back at the results listing and has no `rid`). The
-    // broadened selector otherwise double-counts each card, wasting an
-    // attempt on the listing page before the real detail link succeeds.
+    // FamilyTreeNow commonly renders two links for the same person card.
+    // The search-level `smck` token may be shared across many different people,
+    // so it must never be used as the primary person identity. Prefer `rid`,
+    // then the normalized detail URL, and only fall back to the card text.
     const dedupedCards = [];
-    const smckIndex = new Map();
+    const cardIndex = new Map();
 
     for (const card of cards) {
         const href = card.href || "";
-        const smck =
-            (href.match(/[?&]smck=([^&#]+)/) || [])[1];
-        const key = smck || href || `button-${dedupedCards.length}`;
-        const hasRid = /[?&]rid=/.test(href);
-        const previousIndex = smckIndex.get(key);
+        const rid =
+            (href.match(/[?&]rid=([^&#]+)/) || [])[1];
+        const normalizedHref = href.split("#")[0];
+        const normalizedText = cleanText(card.text).toLowerCase();
+        const key = rid
+            ? `rid:${rid}`
+            : normalizedHref
+                ? `href:${normalizedHref}`
+                : `text:${normalizedText}`;
+        const previousIndex = cardIndex.get(key);
 
         if (previousIndex === undefined) {
-            smckIndex.set(key, dedupedCards.length);
+            cardIndex.set(key, dedupedCards.length);
             dedupedCards.push(card);
-        } else if (
-            hasRid &&
-            !/[?&]rid=/.test(dedupedCards[previousIndex].href || "")
-        ) {
+            continue;
+        }
+
+        // If duplicate variants exist, retain the URL that contains a real
+        // record id because that is the most reliable detail-page target.
+        const previousHref = dedupedCards[previousIndex].href || "";
+        if (rid && !/[?&]rid=/.test(previousHref)) {
             dedupedCards[previousIndex] = card;
         }
     }
+
+    console.log(
+        `[DEBUG] ${dedupedCards.length} distinct FTN person card(s) after dedupe.`,
+    );
 
     dedupedCards.forEach((card, index) => {
         const href = card.href || `button-${index}`;
@@ -2433,14 +2523,16 @@ async function getFamilyTreeNowResults(page, person, city, state) {
         const livedInCityMatch =
             Boolean(expectedCity) &&
             livedInNormalized.length > 0 &&
-            new RegExp(`\b${escapeRegex(expectedCity)}\b`).test(
-                livedInNormalized,
-            ) &&
+            new RegExp(
+                `\\b${escapeRegex(expectedCity)}\\b`,
+                "i",
+            ).test(livedInNormalized) &&
             (expectedState
                 ? new RegExp(
-                    `\b${escapeRegex(
+                    `\\b${escapeRegex(
                         expectedState.toLowerCase(),
-                    )}\b`,
+                    )}\\b`,
+                    "i",
                 ).test(livedInNormalized)
                 : true);
 
@@ -3588,35 +3680,15 @@ async function logNoPhoneDiagnostics(page, person) {
     }
 }
 
-async function enrichOneRow(page, row) {
-    const person = parsePersonName(row.author);
+async function enrichOneRowAtLocation(
+    page,
+    row,
+    person,
+    city,
+    state,
+    resolvedLocation,
+) {
 
-    if (!person) {
-        console.log(
-            `[SKIP] ID ${row.id}: rejected non-strict name ` +
-            `"${row.author}".`,
-        );
-
-        return {
-            status: "invalid_name",
-        };
-    }
-
-    const city = cleanText(row.city);
-    const state = cleanText(row.state).toUpperCase();
-
-    if (!city || !/^[A-Z]{2}$/.test(state)) {
-        console.log(
-            `[SKIP] ID ${row.id}: unusable city/state ` +
-            `"${row.city}, ${row.state}". Leaving the row pending.`,
-        );
-
-        return {
-            status: "location_not_selected",
-        };
-    }
-
-    const resolvedLocation = resolveSearchLocation(city, state);
     const searchCity = resolvedLocation.city;
     const searchState = resolvedLocation.state || state;
 
@@ -3821,6 +3893,144 @@ async function enrichOneRow(page, row) {
 
     return {
         status: "no_mobile_phone",
+    };
+}
+
+
+async function enrichOneRow(page, row) {
+    const person = parsePersonName(row.author);
+
+    if (!person) {
+        console.log(
+            `[SKIP] ID ${row.id}: rejected non-strict name ` +
+            `"${row.author}".`,
+        );
+
+        return {
+            status: "invalid_name",
+        };
+    }
+
+    const city = cleanText(row.city);
+    const state =
+        cleanText(row.state).toUpperCase();
+
+    if (!city || !/^[A-Z]{2}$/.test(state)) {
+        console.log(
+            `[SKIP] ID ${row.id}: unusable city/state ` +
+            `"${row.city}, ${row.state}". ` +
+            `Leaving the row pending.`,
+        );
+
+        return {
+            status: "location_not_selected",
+        };
+    }
+
+    const searchLocations =
+        resolveSearchLocations(city, state);
+
+    console.log(
+        `[LOCATION] "${city}, ${state}" has ` +
+        `${searchLocations.length} search location(s): ` +
+        searchLocations
+            .map(
+                (location) =>
+                    `${location.city}, ${location.state}`,
+            )
+            .join(" | "),
+    );
+
+    let selectedAnyLocation = false;
+    let sawNoMobilePhone = false;
+    let sawFailedAttempt = false;
+
+    for (
+        let index = 0;
+        index < searchLocations.length;
+        index += 1
+    ) {
+        const resolvedLocation =
+            searchLocations[index];
+
+        console.log(
+            `[LOCATION] Attempt ${index + 1}/` +
+            `${searchLocations.length}: ` +
+            `${resolvedLocation.city}, ` +
+            `${resolvedLocation.state}`,
+        );
+
+        const result =
+            await enrichOneRowAtLocation(
+                page,
+                row,
+                person,
+                city,
+                state,
+                resolvedLocation,
+            );
+
+        /*
+         * Stop immediately when a phone is found.
+         * The returned searchCity/searchState remain the city that
+         * actually produced the successful FTN match, so contractor
+         * routing and insertion continue working unchanged.
+         */
+        if (result.status === "updated") {
+            return result;
+        }
+
+        if (
+            result.status !==
+            "location_not_selected"
+        ) {
+            selectedAnyLocation = true;
+        }
+
+        if (
+            result.status ===
+            "no_mobile_phone"
+        ) {
+            sawNoMobilePhone = true;
+        }
+
+        if (result.status === "failed") {
+            sawFailedAttempt = true;
+        }
+
+        if (
+            index <
+            searchLocations.length - 1
+        ) {
+            console.log(
+                `[LOCATION] No usable phone from ` +
+                `${resolvedLocation.city}, ` +
+                `${resolvedLocation.state}; ` +
+                `trying the next parent city.`,
+            );
+        }
+    }
+
+    if (sawNoMobilePhone) {
+        return {
+            status: "no_mobile_phone",
+        };
+    }
+
+    if (sawFailedAttempt) {
+        return {
+            status: "failed",
+        };
+    }
+
+    if (!selectedAnyLocation) {
+        return {
+            status: "location_not_selected",
+        };
+    }
+
+    return {
+        status: "no_matching_result",
     };
 }
 
