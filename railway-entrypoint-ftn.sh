@@ -7,8 +7,8 @@
 # launchPersistentContext (the script's own chromium channel), so we only need
 # a virtual display + the chromium runtime deps.
 #
-#   1. export HOME / XDG_RUNTIME_DIR / TMPDIR (on the Railway volume so the
-#      persistent browser profile survives restarts)
+#   1. keep disposable Chromium runtime/profile data under /tmp, while
+#      retaining /data only for truly persistent Railway volume data
 #   2. build DATABASE_URL from DB_* vars (node one-liner, bare URL — no
 #      sslmode; the script's Pool sets ssl:{rejectUnauthorized:false}) if
 #      DATABASE_URL is not already set
@@ -28,28 +28,85 @@ trap 'rc=$?; err "entrypoint failed (exit $rc) on line $LINENO"; exit $rc' ERR
 log "starting Phase 2 FTN enrichment entrypoint"
 
 # ----------------------------------------------------------------------------
-# 1. HOME / XDG_RUNTIME_DIR / TMPDIR on the Railway volume
+# 1. Runtime directories
 # ----------------------------------------------------------------------------
-# Railway mounts volumes at /data by default. The persistent browser profile
-# (playwright-core launchPersistentContext uses os.tmpdir()) must live on this
-# volume so cookies/sessions survive container restarts. We point TMPDIR there
-# because the script derives its userDataDir from os.tmpdir().
+# The FTN workers create a NEW Chromium userDataDir for every worker/run.
+# Those profiles are disposable and must NOT live on the persistent Railway
+# volume. Keep them under /tmp so they disappear when the container is replaced.
+#
+# The Railway volume remains available at /data for anything that truly needs
+# persistence, but Chromium worker profiles, caches, and runtime files do not.
+
 RAILWAY_VOLUME="${RAILWAY_VOLUME_PATH:-/data}"
+
 if [ ! -d "${RAILWAY_VOLUME}" ]; then
-    log "Railway volume ${RAILWAY_VOLUME} not present; using /tmp instead"
-    RAILWAY_VOLUME="/tmp"
+    log "Railway volume ${RAILWAY_VOLUME} not present; continuing without it"
 fi
 
-export HOME="${HOME:-${RAILWAY_VOLUME}/home}"
-export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-${RAILWAY_VOLUME}/xdg}"
-export TMPDIR="${TMPDIR:-${RAILWAY_VOLUME}/ftn}"
+# HOME may remain the normal container HOME.
+export HOME="${HOME:-/root}"
 
-mkdir -p "${HOME}" "${XDG_RUNTIME_DIR}" "${TMPDIR}"
+# Chromium / Playwright disposable runtime data.
+export TMPDIR="/tmp/ftn"
+export TMP="${TMPDIR}"
+export TEMP="${TMPDIR}"
+export XDG_RUNTIME_DIR="/tmp/ftn-xdg"
+export XDG_CACHE_HOME="/tmp/ftn-cache"
+
+mkdir -p \
+    "${TMPDIR}" \
+    "${XDG_RUNTIME_DIR}" \
+    "${XDG_CACHE_HOME}"
+
 chmod 700 "${XDG_RUNTIME_DIR}" 2>/dev/null || true
 
 log "HOME=${HOME}"
 log "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}"
 log "TMPDIR=${TMPDIR}"
+log "XDG_CACHE_HOME=${XDG_CACHE_HOME}"
+
+# ----------------------------------------------------------------------------
+# Storage diagnostics
+# ----------------------------------------------------------------------------
+
+log "============================================================"
+log "FTN STORAGE CHECK"
+log "============================================================"
+
+log "Filesystem usage:"
+df -h 2>/dev/null || true
+
+if [ -d /data ]; then
+    log "/data total usage:"
+    du -sh /data 2>/dev/null || true
+fi
+
+if [ -d /data/ftn ]; then
+    log "/data/ftn usage BEFORE stale-profile cleanup:"
+    du -sh /data/ftn 2>/dev/null || true
+
+    log "Largest items currently in /data/ftn:"
+    du -sh /data/ftn/* 2>/dev/null \
+        | sort -h \
+        | tail -20 \
+        || true
+
+    # These directories came from the old configuration where TMPDIR=/data/ftn.
+    # A freshly-started trigger-server has no active FTN workers yet, so these
+    # are stale disposable browser profiles from previous runs.
+    log "Removing stale FTN Chromium worker profiles from persistent storage..."
+
+    rm -rf /data/ftn/ftn-worker-* 2>/dev/null || true
+    rm -f /data/ftn/ftn-batch-*.json 2>/dev/null || true
+
+    log "/data/ftn usage AFTER stale-profile cleanup:"
+    du -sh /data/ftn 2>/dev/null || true
+fi
+
+log "/tmp FTN runtime usage:"
+du -sh "${TMPDIR}" 2>/dev/null || true
+
+log "============================================================"
 
 # ----------------------------------------------------------------------------
 # 2. Build DATABASE_URL from DB_* vars if not already set
