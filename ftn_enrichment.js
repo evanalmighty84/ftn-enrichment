@@ -560,6 +560,34 @@ function randomDelay() {
     return min + Math.floor(Math.random() * (max - min + 1));
 }
 
+// Remove disposable FTN runtime artifacts after each worker/run.
+// Chromium persistent contexts create a full user-data directory, and merely
+// closing the context does not delete that directory. Keeping these profiles
+// around causes /tmp to grow across repeated trigger-server runs.
+async function removeTempArtifact(targetPath, label = "temporary artifact") {
+    if (!targetPath) {
+        return;
+    }
+
+    try {
+        await fs.promises.rm(targetPath, {
+            recursive: true,
+            force: true,
+            maxRetries: 3,
+            retryDelay: 250,
+        });
+
+        console.log(
+            `[CLEANUP] Removed ${label}: ${targetPath}`,
+        );
+    } catch (error) {
+        console.warn(
+            `[CLEANUP] Could not remove ${label} ${targetPath}: ` +
+            `${error.message}`,
+        );
+    }
+}
+
 /**
  * Accept only an unmistakable two-word personal name.
  *
@@ -4100,32 +4128,49 @@ async function launchSmartProxyBrowser(workerIndex) {
         `${proxyIp}:${PROXY_PORT}`,
     );
 
-    const context = await chromium.launchPersistentContext(userDataDir, {
-        channel: "chrome",
-        headless: false,
-        viewport: null,
-        proxy,
-        args: [
-            "--disable-blink-features=AutomationControlled",
-            "--no-first-run",
-            "--no-default-browser-check",
-            // Required when running as root inside a container (Railway/Docker):
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-        ],
-    });
+    let context;
 
-    const page = context.pages()[0] || (await context.newPage());
-    await page.bringToFront();
+    try {
+        context = await chromium.launchPersistentContext(userDataDir, {
+            channel: "chrome",
+            headless: false,
+            viewport: null,
+            proxy,
+            args: [
+                "--disable-blink-features=AutomationControlled",
+                "--no-first-run",
+                "--no-default-browser-check",
+                // Required when running as root inside a container (Railway/Docker):
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        });
 
-    page.setDefaultTimeout(30_000);
-    page.setDefaultNavigationTimeout(60_000);
+        const page =
+            context.pages()[0] || (await context.newPage());
 
-    await page.addInitScript(TURNSTILE_INIT_SCRIPT);
-    await warmUpProxy(page, workerIndex);
+        await page.bringToFront();
 
-    return { context, page };
+        page.setDefaultTimeout(30_000);
+        page.setDefaultNavigationTimeout(60_000);
+
+        await page.addInitScript(TURNSTILE_INIT_SCRIPT);
+        await warmUpProxy(page, workerIndex);
+
+        return { context, page, userDataDir };
+    } catch (error) {
+        // launchPersistentContext can create part/all of the profile directory
+        // before throwing. Clean it here because runWorker never receives the
+        // userDataDir when the launcher itself fails.
+        await context?.close().catch(() => {});
+        await removeTempArtifact(
+            userDataDir,
+            `failed worker ${workerIndex} Chromium profile`,
+        );
+
+        throw error;
+    }
 }
 
 function chunkRoundRobin(items, k) {
@@ -4307,6 +4352,13 @@ async function runWorker() {
                 .readFile(batchFile, "utf8")
                 .catch(() => "[]"),
         );
+
+        // The worker no longer needs its handoff file after it has been read.
+        // Delete it immediately; the master also performs fallback cleanup.
+        await removeTempArtifact(
+            batchFile,
+            `worker ${workerIndex} batch file`,
+        );
     }
 
     console.log(
@@ -4316,6 +4368,7 @@ async function runWorker() {
 
     let context;
     let page;
+    let userDataDir = null;
 
     try {
         if (BROWSER_MODE === "multilogin") {
@@ -4339,7 +4392,7 @@ async function runWorker() {
             page.setDefaultNavigationTimeout(60_000);
             await page.addInitScript(TURNSTILE_INIT_SCRIPT);
         } else {
-            ({ context, page } =
+            ({ context, page, userDataDir } =
                 await launchSmartProxyBrowser(workerIndex));
         }
 
@@ -4363,9 +4416,17 @@ async function runWorker() {
     } finally {
         await page?.close().catch(() => {});
 
-        // Only the smartproxy context is ours to close; Multilogin owns its.
+        // Only the Smartproxy context is ours to close; Multilogin owns its.
         if (BROWSER_MODE !== "multilogin") {
             await context?.close().catch(() => {});
+
+            // launchPersistentContext does NOT delete its userDataDir on close.
+            // Remove the complete disposable Chromium profile after every
+            // worker so repeated /run requests cannot fill /tmp.
+            await removeTempArtifact(
+                userDataDir,
+                `worker ${workerIndex} Chromium profile`,
+            );
         }
 
         await pool.end().catch(() => {});
@@ -4464,9 +4525,11 @@ async function runMaster() {
 
     await Promise.all(workers);
 
+    // Fallback cleanup. Workers normally delete their handoff files as soon
+    // as they read them, but the master removes anything left behind.
     await Promise.all(
-        batchFiles.map((f) =>
-            fs.promises.unlink(f).catch(() => {}),
+        batchFiles.map((file) =>
+            removeTempArtifact(file, "master batch file"),
         ),
     );
 
