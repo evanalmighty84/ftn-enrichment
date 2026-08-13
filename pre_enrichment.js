@@ -127,15 +127,22 @@ const ALLOWED_NORMALIZED = new Map(
 
 const SYSTEM_PROMPT = `You classify Nextdoor neighborhood posts for a general-contractor lead pipeline.
 
-A post is a LEAD (is_lead=true) ONLY when the AUTHOR is a homeowner/property owner SEEKING TO HIRE someone for a service ON or IN their home or property: general-contracting (deck, fence, remodel, addition, roofing, siding, restoration, foundation, garage), home trades (plumbing, electrical, HVAC, gutters, windows, doors, drywall, tile, painting, lighting, generator), or home maintenance (lawn/yard, landscaping, house cleaning, handyman, pest control, junk removal, pool, power washing, exterior lighting, christmas lights ) insurance ( they are in search of either home insurance or auto insurance or filing an insurance claim) realtor (They are looking to move or sell their house or are someone in search of renting or buying a house) 
-NOT a lead when the author is advertising their own services, posting spam/duplicates, only recommending a pro they already used, says the job is done, is not a home service, is off-topic, is venting/asking with no intent to hire, or is about moving.
+A post is a LEAD (is_lead=true) ONLY when the AUTHOR is a homeowner/property owner SEEKING TO HIRE someone for a service ON or IN their home or property, OR is seeking referrals, recommendations, advice about which professional/company to use, asking who to call, asking what type of professional handles an unresolved home/property problem, asking about companies others have used, or otherwise showing reasonable intent to find professional help for that problem.
+
+These referral/recommendation/advice posts ARE leads even when the author has not explicitly said "I want to hire someone," requested a quote, or named a specific contractor yet. For example, "looking for referrals for pier companies," "who do you recommend for foundation repair?", "what kind of contractor handles this?", "has anyone used a good deck company?", and "who should I call about these cracks?" are leads because the homeowner is seeking professional help for an unresolved property need.
+
+Relevant services include: general-contracting (deck, fence, remodel, addition, roofing, siding, restoration, foundation, garage), home trades (plumbing, electrical, HVAC, gutters, windows, doors, drywall, tile, painting, lighting, generator), or home maintenance (lawn/yard, landscaping, house cleaning, handyman, pest control, junk removal, pool, power washing, exterior lighting, christmas lights ) insurance ( they are in search of either home insurance or auto insurance or filing an insurance claim) realtor (They are looking to move or sell their house or are someone in search of renting or buying a house)
+
+NOT a lead when the author is advertising their own services, posting spam/duplicates, only recommending a pro they already used, says the job is done, is not a home service, is off-topic, is purely discussing DIY/how-to information with no indication they are considering professional help, or is venting with no unresolved service need or professional-help intent, or is about moving.
 
 lead_type is an ARRAY of one or more atomic trade values describing what the post is about, chosen from this list:
 ${JSON.stringify(ALLOWED_LEAD_TYPES)}
+
 Pick only the trades the work actually involves. If no trade applies (e.g. off-topic), return an empty array []. Every element must match a list entry exactly.
 
 Respond with ONLY a JSON array, no markdown. Each element:
 {"id":<number>,"is_lead":<bool>,"lead_type":[<allowed strings>],"lead_reason":"<short sentence>"}
+
 Preserve every input id.`;
 
 /**
