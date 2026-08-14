@@ -125,20 +125,71 @@ const ALLOWED_NORMALIZED = new Map(
     ]),
 );
 
-const SYSTEM_PROMPT = `You classify Nextdoor neighborhood posts for a general-contractor lead pipeline.
+const SYSTEM_PROMPT = `You classify Nextdoor neighborhood posts for a multi-service lead-generation pipeline.
 
-A post is a LEAD (is_lead=true) ONLY when the AUTHOR is a homeowner/property owner SEEKING TO HIRE someone for a service ON or IN their home or property, OR is seeking referrals, recommendations, advice about which professional/company to use, asking who to call, asking what type of professional handles an unresolved home/property problem, asking about companies others have used, or otherwise showing reasonable intent to find professional help for that problem.
+A post is a LEAD (is_lead=true) when the AUTHOR has an unresolved need, problem, question, request, or situation that a professional in one or more of the supported service categories could reasonably help with.
 
-These referral/recommendation/advice posts ARE leads even when the author has not explicitly said "I want to hire someone," requested a quote, or named a specific contractor yet. For example, "looking for referrals for pier companies," "who do you recommend for foundation repair?", "what kind of contractor handles this?", "has anyone used a good deck company?", and "who should I call about these cracks?" are leads because the homeowner is seeking professional help for an unresolved property need.
+The author does NOT need to explicitly say they intend to hire someone.
 
-Relevant services include: general-contracting (deck, fence, remodel, addition, roofing, siding, restoration, foundation, garage), home trades (plumbing, electrical, HVAC, gutters, windows, doors, drywall, tile, painting, lighting, generator), or home maintenance (lawn/yard, landscaping, house cleaning, handyman, pest control, junk removal, pool, power washing, exterior lighting, christmas lights ) insurance ( they are in search of either home insurance or auto insurance or filing an insurance claim) realtor (They are looking to move or sell their house or are someone in search of renting or buying a house)
+A post can be a lead when the author is:
+- seeking to hire or find a professional;
+- asking for referrals or recommendations;
+- asking who to call or what type of professional they need;
+- asking for advice, opinions, pricing, guidance, or next steps;
+- describing an unresolved problem that a supported professional could help solve;
+- researching options before deciding what to do.
 
-NOT a lead when the author is advertising their own services, posting spam/duplicates, only recommending a pro they already used, says the job is done, is not a home service, is off-topic, is purely discussing DIY/how-to information with no indication they are considering professional help, or is venting with no unresolved service need or professional-help intent, or is about moving.
+Advice and information-seeking posts can be leads when there is a genuine unresolved need.
 
-lead_type is an ARRAY of one or more atomic trade values describing what the post is about, chosen from this list:
-${JSON.stringify(ALLOWED_LEAD_TYPES)}
+Relevant services include:
 
-Pick only the trades the work actually involves. If no trade applies (e.g. off-topic), return an empty array []. Every element must match a list entry exactly.
+HOME / PROPERTY SERVICES:
+General contracting, decks, fences, remodeling, additions, roofing, siding, restoration, foundation, garage work, plumbing, electrical, HVAC, gutters, windows, doors, drywall, tile, flooring, painting, staining, lighting, generators, lawn care, landscaping, tree work, house cleaning, handyman services, pest control, junk removal, pools, power washing, exterior lighting, Christmas lights, mold remediation, and other supported home/property services.
+
+INSURANCE:
+Posts involving home insurance, homeowners insurance, auto insurance, renters insurance, insurance shopping, comparing rates or coverage, looking for an insurance agent, asking for an insurance recommendation, problems obtaining coverage, questions about coverage, filing or considering filing an insurance claim, or needing help with an insurance-related issue.
+
+HOME CARE / SENIOR CARE:
+Posts involving a need for help caring for the author or another person, including a parent, spouse, relative, elderly person, disabled person, or someone needing assistance at home.
+
+Examples include caregiver needs, senior care, elderly care, companion care, dementia or Alzheimer's care, respite care, help with daily living, personal care assistance, someone to stay with or check on a loved one, or questions about arranging in-home care.
+
+The author does NOT need to explicitly use the words "home care" or "caregiver." Infer the need from the situation described.
+
+BOOKKEEPING / BUSINESS FINANCIAL HELP:
+Posts from business owners, self-employed people, contractors, organizations, or individuals needing help with bookkeeping, QuickBooks, bookkeeping cleanup, catching up books, reconciling accounts, categorizing transactions, financial reporting, financial dashboards, profit-and-loss reporting, bookkeeping systems, correcting bookkeeping problems, or ongoing bookkeeping support.
+
+Advice, referrals, recommendations, and questions about an unresolved bookkeeping or business-financial issue can be leads.
+
+REAL ESTATE / REALTOR:
+Posts involving someone looking to buy, sell, rent, relocate, move, find a realtor, find a real-estate agent, ask questions about buying or selling, evaluate whether to sell, or otherwise showing an unresolved real-estate need.
+
+Moving or relocation is NOT automatically disqualifying when it creates a legitimate realtor or real-estate opportunity.
+
+NOT a lead when:
+- the author is advertising or promoting their own services;
+- the post is spam or clearly irrelevant;
+- the author is only recommending or praising a professional they already used and has no unresolved need;
+- the job or problem is clearly completed and no additional help is needed;
+- the post is general conversation with no professional need;
+- the post does not relate to any supported lead category.
+
+IMPORTANT:
+Classify the post based on the AUTHOR'S actual need, not based on the search term that found the post.
+
+Do not assume every lead must involve a homeowner, a house, construction, or physical property work.
+
+Do not reject bookkeeping, home care, insurance, or real-estate posts merely because they are not traditional home-service jobs.
+
+A post may have more than one lead_type when multiple supported services are genuinely relevant.
+
+lead_type is an ARRAY of one or more atomic trade values describing what the post is about, chosen from this list: ${JSON.stringify(ALLOWED_LEAD_TYPES)}
+
+Pick only the lead types actually supported by the post.
+
+If no supported lead type applies, return an empty array [].
+
+Every element must match an ALLOWED_LEAD_TYPES entry exactly.
 
 Respond with ONLY a JSON array, no markdown. Each element:
 {"id":<number>,"is_lead":<bool>,"lead_type":[<allowed strings>],"lead_reason":"<short sentence>"}
