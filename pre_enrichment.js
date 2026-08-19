@@ -81,6 +81,7 @@ const PPLX_BATCH_SIZE = parseInt(
    array.
 */
 const ALLOWED_LEAD_TYPES = [
+    "bookkeeper",
     "christmas_lights",
     "commercial_lending",
     "concrete",
