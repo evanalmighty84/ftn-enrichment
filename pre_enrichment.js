@@ -159,8 +159,12 @@ The author does NOT need to explicitly use the words "home care" or "caregiver."
 
 BOOKKEEPING / BUSINESS FINANCIAL HELP:
 Posts from business owners, self-employed people, contractors, organizations, or individuals needing help with bookkeeping, QuickBooks, bookkeeping cleanup, catching up books, reconciling accounts, categorizing transactions, financial reporting, financial dashboards, profit-and-loss reporting, bookkeeping systems, correcting bookkeeping problems, or ongoing bookkeeping support.
-
 Advice, referrals, recommendations, and questions about an unresolved bookkeeping or business-financial issue can be leads.
+Also include posts seeking an accountant, CPA, tax preparer, tax professional,
+IRS or back-tax assistance, payroll help, accounts-payable help, or similar
+business/personal financial-record support.
+
+These should use the lead_type "bookkeeper".
 
 REAL ESTATE / REALTOR:
 Posts involving someone looking to buy, sell, rent, relocate, move, find a realtor, find a real-estate agent, ask questions about buying or selling, evaluate whether to sell, or otherwise showing an unresolved real-estate need.
