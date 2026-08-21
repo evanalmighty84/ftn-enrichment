@@ -1,0 +1,113 @@
+name: Apply FTN browser recovery patch
+
+on:
+  push:
+    branches:
+      - fix/ftn-browser-recovery
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/ftn-browser-recovery
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Apply browser recovery patch
+        shell: bash
+        run: |
+          python <<'PY'
+          from pathlib import Path
+
+          p = Path('ftn_enrichment.js')
+          text = p.read_text()
+
+          def replace_once(old, new, label):
+              global text
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f'{label}: expected 1 match, found {count}')
+              text = text.replace(old, new, 1)
+
+          replace_once(
+              'Build: RESULT_CITY_MATCH_V7 - workers: ${WORKER_COUNT} - ',
+              'Build: RESULT_CITY_MATCH_V8_BROWSER_RECOVERY - workers: ${WORKER_COUNT} - ',
+              'build marker',
+          )
+
+          replace_once(
+              '''                "--no-sandbox",\n                "--disable-setuid-sandbox",\n                "--disable-dev-shm-usage",\n            ],''',
+              '''                "--no-sandbox",\n                "--disable-setuid-sandbox",\n                "--disable-dev-shm-usage",\n                "--disable-gpu",\n            ],''',
+              'chrome flags',
+          )
+
+          replace_once(
+              '''        await page.addInitScript(TURNSTILE_INIT_SCRIPT);\n        await warmUpProxy(page, workerIndex);\n\n        return { context, page, userDataDir };''',
+              '''        await page.addInitScript(TURNSTILE_INIT_SCRIPT);\n\n        page.on("crash", () => {\n            console.error(\n                `[BROWSER] Worker ${workerIndex}: page crash event received.`,\n            );\n        });\n\n        context.on("close", () => {\n            console.error(\n                `[BROWSER] Worker ${workerIndex}: browser context closed.`,\n            );\n        });\n\n        await warmUpProxy(page, workerIndex);\n\n        return { context, page, userDataDir };''',
+              'crash diagnostics',
+          )
+
+          replace_once(
+              'function chunkRoundRobin(items, k) {',
+              '''function isBrowserCrashError(error) {\n    const message = String(error?.message || error || "");\n\n    return /page crashed|target crashed|err_aborted|browser.*closed|context.*closed|page.*closed|has been closed|crsession|connection.*closed|protocol error/i.test(\n        message,\n    );\n}\n\nfunction chunkRoundRobin(items, k) {''',
+              'browser crash classifier',
+          )
+
+          replace_once(
+              'async function runEnrichmentLoop(page, rows, workerIndex) {',
+              '''async function runEnrichmentLoop(\n    initialPage,\n    rows,\n    workerIndex,\n    restartBrowserSession,\n) {\n    let page = initialPage;''',
+              'loop signature',
+          )
+
+          replace_once(
+              '''                const looksLikeCaptcha =\n                    /captcha|turnstile|verification|2captcha/i.test(\n                        error.message,\n                    );\n\n                if (looksLikeCaptcha && attempt === 1) {\n                    await ensureCaptchaSolved(page).catch(\n                        (e) => {\n                            console.error(\n                                `   retry clear-up failed: ${e.message}`,\n                            );\n                        },\n                    );\n                    continue;\n                }\n\n                totals.failed += 1;\n                break;''',
+              '''                const looksLikeCaptcha =\n                    /captcha|turnstile|verification|2captcha/i.test(\n                        error.message,\n                    );\n\n                const browserCrashed = isBrowserCrashError(error);\n\n                if (browserCrashed && attempt === 1) {\n                    console.error(\n                        `[BROWSER] Worker ${workerIndex}: browser/page failure ` +\n                        `on ID ${row.id}; rebuilding the browser session before ` +\n                        `attempt 2/2.`,\n                    );\n\n                    try {\n                        page = await restartBrowserSession();\n                        continue;\n                    } catch (restartError) {\n                        console.error(\n                            `[BROWSER] Worker ${workerIndex}: restart failed: ` +\n                            `${restartError.message}`,\n                        );\n                        totals.failed += 1;\n                        break;\n                    }\n                }\n\n                if (looksLikeCaptcha && attempt === 1) {\n                    await ensureCaptchaSolved(page).catch(\n                        (e) => {\n                            console.error(\n                                `   retry clear-up failed: ${e.message}`,\n                            );\n                        },\n                    );\n                    continue;\n                }\n\n                totals.failed += 1;\n                break;''',
+              'retry catch',
+          )
+
+          replace_once(
+              '''        if (BROWSER_MODE === "multilogin") {\n            if (!process.env.MULTILOGIN_WS) {\n                throw new Error("MULTILOGIN_WS is missing.");\n            }\n\n            const browser = await chromium.connectOverCDP(\n                process.env.MULTILOGIN_WS,\n            );\n            context = browser.contexts()[0];\n\n            if (!context) {\n                throw new Error(\n                    "No Multilogin browser context found.",\n                );\n            }\n\n            page = await context.newPage();\n            page.setDefaultTimeout(30_000);\n            page.setDefaultNavigationTimeout(60_000);\n            await page.addInitScript(TURNSTILE_INIT_SCRIPT);\n        } else {\n            ({ context, page, userDataDir } =\n                await launchSmartProxyBrowser(workerIndex));\n        }\n\n        const totals = await runEnrichmentLoop(\n            page,\n            rows,\n            workerIndex,\n        );''',
+              '''        const launchWorkerSession = async () => {\n            if (BROWSER_MODE === "multilogin") {\n                if (!process.env.MULTILOGIN_WS) {\n                    throw new Error("MULTILOGIN_WS is missing.");\n                }\n\n                const browser = await chromium.connectOverCDP(\n                    process.env.MULTILOGIN_WS,\n                );\n                context = browser.contexts()[0];\n\n                if (!context) {\n                    throw new Error(\n                        "No Multilogin browser context found.",\n                    );\n                }\n\n                page = await context.newPage();\n                page.setDefaultTimeout(30_000);\n                page.setDefaultNavigationTimeout(60_000);\n                await page.addInitScript(TURNSTILE_INIT_SCRIPT);\n\n                page.on("crash", () => {\n                    console.error(\n                        `[BROWSER] Worker ${workerIndex}: page crash event received.`,\n                    );\n                });\n\n                return page;\n            }\n\n            ({ context, page, userDataDir } =\n                await launchSmartProxyBrowser(workerIndex));\n\n            return page;\n        };\n\n        const restartBrowserSession = async () => {\n            console.log(\n                `[BROWSER] Worker ${workerIndex}: closing failed session...`,\n            );\n\n            await page?.close().catch(() => {});\n\n            if (BROWSER_MODE !== "multilogin") {\n                await context?.close().catch(() => {});\n                await removeTempArtifact(\n                    userDataDir,\n                    `worker ${workerIndex} crashed Chromium profile`,\n                );\n                userDataDir = null;\n            }\n\n            page = null;\n\n            console.log(\n                `[BROWSER] Worker ${workerIndex}: launching replacement session...`,\n            );\n\n            return launchWorkerSession();\n        };\n\n        await launchWorkerSession();\n\n        const totals = await runEnrichmentLoop(\n            page,\n            rows,\n            workerIndex,\n            restartBrowserSession,\n        );''',
+              'worker session ownership',
+          )
+
+          replace_once(
+              '''    printGrandTotals(workerReports, rows.length);\n\n    await pool.end().catch(() => {});\n}''',
+              '''    const grand = printGrandTotals(workerReports, rows.length);\n\n    const workerFailed = exitCodes.some(\n        (code) => code !== 0,\n    );\n\n    const systemicFailure = Boolean(\n        grand &&\n        grand.updated === 0 &&\n        grand.failed >= Math.max(3, Math.ceil(rows.length * 0.5)),\n    );\n\n    await pool.end().catch(() => {});\n\n    if (workerFailed || systemicFailure) {\n        throw new Error(\n            `FTN enrichment failed: workerFailed=${workerFailed}, ` +\n            `updated=${grand?.updated || 0}, failed=${grand?.failed || 0}, ` +\n            `loaded=${rows.length}.`,\n        );\n    }\n}''',
+              'master failure handling',
+          )
+
+          replace_once(
+              '''function printGrandTotals(reports, totalRowsLoaded) {\n    if (!reports.length) {\n        return;\n    }''',
+              '''function printGrandTotals(reports, totalRowsLoaded) {\n    if (!reports.length) {\n        return null;\n    }''',
+              'grand totals empty return',
+          )
+
+          replace_once(
+              '''    console.log(\n        "============================================================",\n    );\n}\n\nif (require.main === module) {''',
+              '''    console.log(\n        "============================================================",\n    );\n\n    return grand;\n}\n\nif (require.main === module) {''',
+              'grand totals return',
+          )
+
+          p.write_text(text)
+          PY
+
+          node --check ftn_enrichment.js
+
+      - name: Commit patched enrichment file
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- ftn_enrichment.js
+          git rm -- .github/workflows/apply-ftn-browser-recovery.yml
+          git commit -m "Recover FTN browser sessions after page crashes"
+          git push origin HEAD:fix/ftn-browser-recovery
