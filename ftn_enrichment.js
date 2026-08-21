@@ -4144,6 +4144,7 @@ async function launchSmartProxyBrowser(workerIndex) {
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
             ],
         });
 
@@ -4156,6 +4157,19 @@ async function launchSmartProxyBrowser(workerIndex) {
         page.setDefaultNavigationTimeout(60_000);
 
         await page.addInitScript(TURNSTILE_INIT_SCRIPT);
+
+        page.on("crash", () => {
+            console.error(
+                `[BROWSER] Worker ${workerIndex}: page crash event received.`,
+            );
+        });
+
+        context.on("close", () => {
+            console.error(
+                `[BROWSER] Worker ${workerIndex}: browser context closed.`,
+            );
+        });
+
         await warmUpProxy(page, workerIndex);
 
         return { context, page, userDataDir };
@@ -4173,6 +4187,14 @@ async function launchSmartProxyBrowser(workerIndex) {
     }
 }
 
+function isBrowserCrashError(error) {
+    const message = String(error?.message || error || "");
+
+    return /page crashed|target crashed|err_aborted|browser.*closed|context.*closed|page.*closed|has been closed|crsession|connection.*closed|protocol error/i.test(
+        message,
+    );
+}
+
 function chunkRoundRobin(items, k) {
     const batches = Array.from({ length: k }, () => []);
     items.forEach((item, i) => batches[i % k].push(item));
@@ -4181,7 +4203,13 @@ function chunkRoundRobin(items, k) {
 
 // The per-worker row loop. Returns totals; does NOT close the browser or
 // the pool - the caller (runWorker) owns those.
-async function runEnrichmentLoop(page, rows, workerIndex) {
+async function runEnrichmentLoop(
+    initialPage,
+    rows,
+    workerIndex,
+    restartBrowserSession,
+) {
+    let page = initialPage;
     const totals = {
         updated: 0,
         invalid_name: 0,
@@ -4218,6 +4246,28 @@ async function runEnrichmentLoop(page, rows, workerIndex) {
                     /captcha|turnstile|verification|2captcha/i.test(
                         error.message,
                     );
+
+                const browserCrashed = isBrowserCrashError(error);
+
+                if (browserCrashed && attempt === 1) {
+                    console.error(
+                        `[BROWSER] Worker ${workerIndex}: browser/page failure ` +
+                        `on ID ${row.id}; rebuilding the browser session before ` +
+                        `attempt 2/2.`,
+                    );
+
+                    try {
+                        page = await restartBrowserSession();
+                        continue;
+                    } catch (restartError) {
+                        console.error(
+                            `[BROWSER] Worker ${workerIndex}: restart failed: ` +
+                            `${restartError.message}`,
+                        );
+                        totals.failed += 1;
+                        break;
+                    }
+                }
 
                 if (looksLikeCaptcha && attempt === 1) {
                     await ensureCaptchaSolved(page).catch(
@@ -4371,35 +4421,75 @@ async function runWorker() {
     let userDataDir = null;
 
     try {
-        if (BROWSER_MODE === "multilogin") {
-            if (!process.env.MULTILOGIN_WS) {
-                throw new Error("MULTILOGIN_WS is missing.");
-            }
+        const launchWorkerSession = async () => {
+            if (BROWSER_MODE === "multilogin") {
+                if (!process.env.MULTILOGIN_WS) {
+                    throw new Error("MULTILOGIN_WS is missing.");
+                }
 
-            const browser = await chromium.connectOverCDP(
-                process.env.MULTILOGIN_WS,
-            );
-            context = browser.contexts()[0];
-
-            if (!context) {
-                throw new Error(
-                    "No Multilogin browser context found.",
+                const browser = await chromium.connectOverCDP(
+                    process.env.MULTILOGIN_WS,
                 );
+                context = browser.contexts()[0];
+
+                if (!context) {
+                    throw new Error(
+                        "No Multilogin browser context found.",
+                    );
+                }
+
+                page = await context.newPage();
+                page.setDefaultTimeout(30_000);
+                page.setDefaultNavigationTimeout(60_000);
+                await page.addInitScript(TURNSTILE_INIT_SCRIPT);
+
+                page.on("crash", () => {
+                    console.error(
+                        `[BROWSER] Worker ${workerIndex}: page crash event received.`,
+                    );
+                });
+
+                return page;
             }
 
-            page = await context.newPage();
-            page.setDefaultTimeout(30_000);
-            page.setDefaultNavigationTimeout(60_000);
-            await page.addInitScript(TURNSTILE_INIT_SCRIPT);
-        } else {
             ({ context, page, userDataDir } =
                 await launchSmartProxyBrowser(workerIndex));
-        }
+
+            return page;
+        };
+
+        const restartBrowserSession = async () => {
+            console.log(
+                `[BROWSER] Worker ${workerIndex}: closing failed session...`,
+            );
+
+            await page?.close().catch(() => {});
+
+            if (BROWSER_MODE !== "multilogin") {
+                await context?.close().catch(() => {});
+                await removeTempArtifact(
+                    userDataDir,
+                    `worker ${workerIndex} crashed Chromium profile`,
+                );
+                userDataDir = null;
+            }
+
+            page = null;
+
+            console.log(
+                `[BROWSER] Worker ${workerIndex}: launching replacement session...`,
+            );
+
+            return launchWorkerSession();
+        };
+
+        await launchWorkerSession();
 
         const totals = await runEnrichmentLoop(
             page,
             rows,
             workerIndex,
+            restartBrowserSession,
         );
         printWorkerTotals(totals, workerIndex);
 
@@ -4439,7 +4529,7 @@ async function runMaster() {
         " FamilyTreeNow General Contracting Enrichment (master) Started",
     );
     console.log(
-        ` Build: RESULT_CITY_MATCH_V7 - workers: ${WORKER_COUNT} - ` +
+        ` Build: RESULT_CITY_MATCH_V8_BROWSER_RECOVERY - workers: ${WORKER_COUNT} - ` +
         `mode: ${BROWSER_MODE}`,
     );
 
@@ -4538,15 +4628,33 @@ async function runMaster() {
         `${exitCodes.join(", ")}`,
     );
 
-    printGrandTotals(workerReports, rows.length);
+    const grand = printGrandTotals(workerReports, rows.length);
+
+    const workerFailed = exitCodes.some(
+        (code) => code !== 0,
+    );
+
+    const systemicFailure = Boolean(
+        grand &&
+        grand.updated === 0 &&
+        grand.failed >= Math.max(3, Math.ceil(rows.length * 0.5)),
+    );
 
     await pool.end().catch(() => {});
+
+    if (workerFailed || systemicFailure) {
+        throw new Error(
+            `FTN enrichment failed: workerFailed=${workerFailed}, ` +
+            `updated=${grand?.updated || 0}, failed=${grand?.failed || 0}, ` +
+            `loaded=${rows.length}.`,
+        );
+    }
 }
 
 // Aggregate per-worker totals into a grand success count and log it.
 function printGrandTotals(reports, totalRowsLoaded) {
     if (!reports.length) {
-        return;
+        return null;
     }
 
     const grand = {
@@ -4594,6 +4702,8 @@ function printGrandTotals(reports, totalRowsLoaded) {
     console.log(
         "============================================================",
     );
+
+    return grand;
 }
 
 if (require.main === module) {
