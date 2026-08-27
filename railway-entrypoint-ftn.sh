@@ -266,7 +266,7 @@ log "  node:    $(node --version 2>/dev/null || echo 'missing')"
 log "  npm:     $(npm --version 2>/dev/null || echo 'missing')"
 log "  DISPLAY: ${DISPLAY}"
 log "  WORKER_COUNT env: ${FTN_WORKER_COUNT:-<unset -> min(PROXY_POOL,3)>}"
-log "  proxy pool: ${FTN_PROXIES:-207.228.202.97,207.228.200.57,107.158.19.135}"
+log "  proxy pool: ${FTN_PROXIES:-207.228.200.16,104.234.48.22,107.158.93.232}"
 
 cd "$(dirname "$0")"
 
