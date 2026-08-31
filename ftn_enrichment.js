@@ -846,6 +846,7 @@ function formatLeadTypeForFamilyTreeNow(leadType) {
 // don't re-query users for every lead in the batch.
 let VERIFIED_CONTRACTORS = null;
 
+
 async function getVerifiedContractors() {
     if (VERIFIED_CONTRACTORS) {
         return VERIFIED_CONTRACTORS;
@@ -4100,8 +4101,12 @@ async function warmUpProxy(page, workerIndex) {
 // smartproxy IP. Mirrors the workerb.js setup (one proxy per worker, warm-up
 // on ipinfo + reebok). Rotate by closing the context and launching a fresh
 // one with the next proxy IP - never swap proxies on a live page.
-async function launchSmartProxyBrowser(workerIndex) {
+async function launchSmartProxyBrowser(
+    workerIndex,
+    proxyIpOverride = "",
+) {
     const proxyIp =
+        proxyIpOverride ||
         process.env.FTN_PROXY_IP ||
         PROXY_POOL[workerIndex % PROXY_POOL.length] ||
         "";
@@ -4172,7 +4177,12 @@ async function launchSmartProxyBrowser(workerIndex) {
 
         await warmUpProxy(page, workerIndex);
 
-        return { context, page, userDataDir };
+        return {
+            context,
+            page,
+            userDataDir,
+            proxyIp,
+        };
     } catch (error) {
         // launchPersistentContext can create part/all of the profile directory
         // before throwing. Clean it here because runWorker never receives the
@@ -4220,6 +4230,44 @@ function isRecoverableBrowserError(error) {
  *   - close only our page
  *   - create a fresh page in that context
  */
+async function bestEffortWithTimeout(
+    operation,
+    timeoutMs,
+    label,
+) {
+    let timer = null;
+
+    try {
+        return await Promise.race([
+            Promise.resolve()
+                .then(operation)
+                .then(() => true)
+                .catch((error) => {
+                    console.warn(
+                        `[RECOVERY] ${label} failed: ` +
+                        `${error?.message || error}`,
+                    );
+
+                    return false;
+                }),
+
+            new Promise((resolve) => {
+                timer = setTimeout(() => {
+                    console.warn(
+                        `[RECOVERY] ${label} timed out after ` +
+                        `${timeoutMs}ms; continuing.`,
+                    );
+
+                    resolve(false);
+                }, timeoutMs);
+            }),
+        ]);
+    } finally {
+        if (timer) {
+            clearTimeout(timer);
+        }
+    }
+}
 async function recoverWorkerBrowser(
     session,
     workerIndex,
@@ -4231,13 +4279,22 @@ async function recoverWorkerBrowser(
     );
 
     if (BROWSER_MODE === "multilogin") {
-        await session.page?.close().catch(() => {});
+        await bestEffortWithTimeout(
+            () => session.page?.close(),
+            5_000,
+            `worker ${workerIndex} page close`,
+        );
 
         session.page =
             await session.context.newPage();
 
-        session.page.setDefaultTimeout(30_000);
-        session.page.setDefaultNavigationTimeout(60_000);
+        session.page.setDefaultTimeout(
+            30_000,
+        );
+
+        session.page.setDefaultNavigationTimeout(
+            60_000,
+        );
 
         await session.page.addInitScript(
             TURNSTILE_INIT_SCRIPT,
@@ -4254,8 +4311,30 @@ async function recoverWorkerBrowser(
     const oldUserDataDir =
         session.userDataDir;
 
-    await session.page?.close().catch(() => {});
-    await session.context?.close().catch(() => {});
+    const oldProxyIp =
+        session.proxyIp ||
+        process.env.FTN_PROXY_IP ||
+        PROXY_POOL[
+        workerIndex %
+        PROXY_POOL.length
+            ] ||
+        "";
+
+    /*
+     * Do NOT allow a poisoned Chromium process to hold recovery
+     * forever.
+     */
+    await bestEffortWithTimeout(
+        () => session.page?.close(),
+        5_000,
+        `worker ${workerIndex} page close`,
+    );
+
+    await bestEffortWithTimeout(
+        () => session.context?.close(),
+        8_000,
+        `worker ${workerIndex} context close`,
+    );
 
     session.page = null;
     session.context = null;
@@ -4267,27 +4346,64 @@ async function recoverWorkerBrowser(
     );
 
     /*
-     * launchSmartProxyBrowser() creates:
-     *   - a completely new persistent Chromium context
-     *   - a fresh page
-     *   - a fresh temporary profile
-     *   - the worker's configured proxy connection
+     * Rotate to the next static proxy.
      *
-     * It also performs the existing proxy warm-up.
+     * Example:
+     * 207.228.200.16
+     *       ↓
+     * 104.234.48.22
+     *       ↓
+     * 107.158.93.232
+     *       ↓
+     * 207.228.200.16
      */
+    let nextProxyIp = oldProxyIp;
+
+    if (PROXY_POOL.length > 1) {
+        const currentIndex =
+            PROXY_POOL.indexOf(
+                oldProxyIp,
+            );
+
+        const nextIndex =
+            currentIndex >= 0
+                ? (
+                currentIndex + 1
+            ) % PROXY_POOL.length
+                : (
+                workerIndex + 1
+            ) % PROXY_POOL.length;
+
+        nextProxyIp =
+            PROXY_POOL[nextIndex];
+    }
+
+    console.log(
+        `[RECOVERY] Worker ${workerIndex}: rotating proxy ` +
+        `${oldProxyIp || "unknown"} -> ${nextProxyIp}`,
+    );
+
     const fresh =
         await launchSmartProxyBrowser(
             workerIndex,
+            nextProxyIp,
         );
 
-    session.context = fresh.context;
-    session.page = fresh.page;
+    session.context =
+        fresh.context;
+
+    session.page =
+        fresh.page;
+
     session.userDataDir =
         fresh.userDataDir;
 
+    session.proxyIp =
+        fresh.proxyIp;
+
     console.log(
-        `[RECOVERY] Worker ${workerIndex}: ` +
-        `fresh Smartproxy browser ready.`,
+        `[RECOVERY] Worker ${workerIndex}: fresh browser ready ` +
+        `via ${fresh.proxyIp}:${PROXY_PORT}.`,
     );
 }
 
@@ -4658,6 +4774,7 @@ async function runWorker() {
         context: null,
         page: null,
         userDataDir: null,
+        proxyIp: null,
     };
 
     try {
@@ -4716,6 +4833,8 @@ async function runWorker() {
 
             session.userDataDir =
                 launched.userDataDir;
+            session.proxyIp =
+                launched.proxyIp;
         }
 
         const totals =
