@@ -147,27 +147,101 @@ const MAX_PHONE_ATTEMPTS = Number(
 // ---- Smartproxy / multi-worker config ----
 // Mirrors your workerb.js setup: one proxy IP per worker.
 // Override with FTN_PROXIES (comma-separated) in .env.
-const PROXY_POOL = (process.env.FTN_PROXIES ||
-    "207.228.200.16,104.234.48.22,107.158.93.232")
+// ---- Smartproxy / multi-worker config ----
+
+// ---- Smartproxy / multi-worker config ----
+
+const PROXY_POOL = (
+    process.env.FTN_PROXIES ||
+    "207.228.200.16,104.234.48.22,107.158.93.232"
+)
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-const PROXY_PORT = Number(process.env.FTN_PROXY_PORT || 6014);
-// Accept both the FTN_-prefixed names (existing/proven) and the bare
-// PROXY_USER / PROXY_PASS names documented in the Phase 2 README. The FTN_
-// prefix wins when both are set so existing behavior is preserved.
-const PROXY_USER =
-    process.env.FTN_PROXY_USER || process.env.PROXY_USER || "smart-kig91nd2ixd4";
-const PROXY_PASS =
-    process.env.FTN_PROXY_PASS || process.env.PROXY_PASS || "viWjWbPWNUVgWG0b";
-const WORKER_COUNT = Number(
-    process.env.FTN_WORKER_COUNT || Math.min(PROXY_POOL.length, 3) || 1,
+
+const PROXY_PORT = Number(
+    process.env.FTN_PROXY_PORT || 6014
 );
-const WARM_UP_ENABLED = String(process.env.FTN_WARM_UP || "1") !== "0";
+
+// FTN-specific env vars take priority.
+// If they are not supplied, use the known sandbox credentials.
+const PROXY_USER =
+    process.env.FTN_PROXY_USER ||
+    "smart-kig91nd2ixd4";
+
+const PROXY_PASS =
+    process.env.FTN_PROXY_PASS ||
+    "viWjWbPWNUVgWG0b";
+
+const WORKER_COUNT = Number(
+    process.env.FTN_WORKER_COUNT ||
+    Math.min(PROXY_POOL.length, 3) ||
+    1
+);
+
+const WARM_UP_ENABLED =
+    String(process.env.FTN_WARM_UP || "1") !== "0";
+
 const BROWSER_MODE = (
     process.env.FTN_BROWSER_MODE || "smartproxy"
 ).toLowerCase();
 
+
+// ---------------------------------------------------------------------------
+// Proxy diagnostics
+// ---------------------------------------------------------------------------
+
+const PROXY_USER_SOURCE =
+    process.env.FTN_PROXY_USER
+        ? "FTN_PROXY_USER"
+        : "HARDCODED SANDBOX FALLBACK";
+
+const PROXY_PASS_SOURCE =
+    process.env.FTN_PROXY_PASS
+        ? "FTN_PROXY_PASS"
+        : "HARDCODED SANDBOX FALLBACK";
+
+const maskedProxyPass = PROXY_PASS
+    ? `${"*".repeat(Math.max(PROXY_PASS.length - 4, 0))}${PROXY_PASS.slice(-4)}`
+    : "(missing)";
+
+console.log("\n========== FTN PROXY CONFIG ==========");
+
+console.log("Proxy pool:", PROXY_POOL);
+console.log("Proxy count:", PROXY_POOL.length);
+console.log("Proxy port:", PROXY_PORT);
+
+console.log("Username source:", PROXY_USER_SOURCE);
+console.log("Password source:", PROXY_PASS_SOURCE);
+
+console.log("Resolved username:", PROXY_USER);
+console.log("Resolved password:", maskedProxyPass);
+
+console.log("Username length:", PROXY_USER?.length || 0);
+console.log("Password length:", PROXY_PASS?.length || 0);
+
+console.log(
+    "Username has outer whitespace:",
+    PROXY_USER !== PROXY_USER.trim()
+);
+
+console.log(
+    "Password has outer whitespace:",
+    PROXY_PASS !== PROXY_PASS.trim()
+);
+
+console.log("Environment variables present:", {
+    FTN_PROXY_USER: !!process.env.FTN_PROXY_USER,
+    FTN_PROXY_PASS: !!process.env.FTN_PROXY_PASS,
+    FTN_PROXIES: !!process.env.FTN_PROXIES,
+    FTN_PROXY_PORT: !!process.env.FTN_PROXY_PORT,
+});
+
+console.log("Worker count:", WORKER_COUNT);
+console.log("Browser mode:", BROWSER_MODE);
+console.log("Warm-up enabled:", WARM_UP_ENABLED);
+
+console.log("======================================\n");
 // ---- Subdivision / neighborhood -> real-city overrides ----
 // The DB `city` column sometimes holds a subdivision or neighborhood name
 // (e.g. "Stonebriar Village") that FamilyTreeNow's city autocomplete can't
