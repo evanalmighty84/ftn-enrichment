@@ -147,101 +147,27 @@ const MAX_PHONE_ATTEMPTS = Number(
 // ---- Smartproxy / multi-worker config ----
 // Mirrors your workerb.js setup: one proxy IP per worker.
 // Override with FTN_PROXIES (comma-separated) in .env.
-// ---- Smartproxy / multi-worker config ----
-
-// ---- Smartproxy / multi-worker config ----
-
-const PROXY_POOL = (
-    process.env.FTN_PROXIES ||
-    "207.228.200.16,104.234.48.22,107.158.93.232"
-)
+const PROXY_POOL = (process.env.FTN_PROXIES ||
+    "207.228.200.16,207.228.200.16.158.93.232")
     .split(",")
     .map((s) => s.trim())
     .filter(Boolean);
-
-const PROXY_PORT = Number(
-    process.env.FTN_PROXY_PORT || 6014
-);
-
-// FTN-specific env vars take priority.
-// If they are not supplied, use the known sandbox credentials.
+const PROXY_PORT = Number(process.env.FTN_PROXY_PORT || 6014);
+// Accept both the FTN_-prefixed names (existing/proven) and the bare
+// PROXY_USER / PROXY_PASS names documented in the Phase 2 README. The FTN_
+// prefix wins when both are set so existing behavior is preserved.
 const PROXY_USER =
-    process.env.FTN_PROXY_USER ||
-    "smart-kig91nd2ixd4";
-
+    process.env.FTN_PROXY_USER || process.env.PROXY_USER || "smart-kig91nd2ixd4";
 const PROXY_PASS =
-    process.env.FTN_PROXY_PASS ||
-    "viWjWbPWNUVgWG0b";
-
+    process.env.FTN_PROXY_PASS || process.env.PROXY_PASS || "viWjWbPWNUVgWG0b";
 const WORKER_COUNT = Number(
-    process.env.FTN_WORKER_COUNT ||
-    Math.min(PROXY_POOL.length, 3) ||
-    1
+    process.env.FTN_WORKER_COUNT || Math.min(PROXY_POOL.length, 3) || 1,
 );
-
-const WARM_UP_ENABLED =
-    String(process.env.FTN_WARM_UP || "1") !== "0";
-
+const WARM_UP_ENABLED = String(process.env.FTN_WARM_UP || "1") !== "0";
 const BROWSER_MODE = (
     process.env.FTN_BROWSER_MODE || "smartproxy"
 ).toLowerCase();
 
-
-// ---------------------------------------------------------------------------
-// Proxy diagnostics
-// ---------------------------------------------------------------------------
-
-const PROXY_USER_SOURCE =
-    process.env.FTN_PROXY_USER
-        ? "FTN_PROXY_USER"
-        : "HARDCODED SANDBOX FALLBACK";
-
-const PROXY_PASS_SOURCE =
-    process.env.FTN_PROXY_PASS
-        ? "FTN_PROXY_PASS"
-        : "HARDCODED SANDBOX FALLBACK";
-
-const maskedProxyPass = PROXY_PASS
-    ? `${"*".repeat(Math.max(PROXY_PASS.length - 4, 0))}${PROXY_PASS.slice(-4)}`
-    : "(missing)";
-
-console.log("\n========== FTN PROXY CONFIG ==========");
-
-console.log("Proxy pool:", PROXY_POOL);
-console.log("Proxy count:", PROXY_POOL.length);
-console.log("Proxy port:", PROXY_PORT);
-
-console.log("Username source:", PROXY_USER_SOURCE);
-console.log("Password source:", PROXY_PASS_SOURCE);
-
-console.log("Resolved username:", PROXY_USER);
-console.log("Resolved password:", maskedProxyPass);
-
-console.log("Username length:", PROXY_USER?.length || 0);
-console.log("Password length:", PROXY_PASS?.length || 0);
-
-console.log(
-    "Username has outer whitespace:",
-    PROXY_USER !== PROXY_USER.trim()
-);
-
-console.log(
-    "Password has outer whitespace:",
-    PROXY_PASS !== PROXY_PASS.trim()
-);
-
-console.log("Environment variables present:", {
-    FTN_PROXY_USER: !!process.env.FTN_PROXY_USER,
-    FTN_PROXY_PASS: !!process.env.FTN_PROXY_PASS,
-    FTN_PROXIES: !!process.env.FTN_PROXIES,
-    FTN_PROXY_PORT: !!process.env.FTN_PROXY_PORT,
-});
-
-console.log("Worker count:", WORKER_COUNT);
-console.log("Browser mode:", BROWSER_MODE);
-console.log("Warm-up enabled:", WARM_UP_ENABLED);
-
-console.log("======================================\n");
 // ---- Subdivision / neighborhood -> real-city overrides ----
 // The DB `city` column sometimes holds a subdivision or neighborhood name
 // (e.g. "Stonebriar Village") that FamilyTreeNow's city autocomplete can't
@@ -4218,6 +4144,7 @@ async function launchSmartProxyBrowser(workerIndex) {
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
+                "--disable-gpu",
             ],
         });
 
@@ -4230,6 +4157,19 @@ async function launchSmartProxyBrowser(workerIndex) {
         page.setDefaultNavigationTimeout(60_000);
 
         await page.addInitScript(TURNSTILE_INIT_SCRIPT);
+
+        page.on("crash", () => {
+            console.error(
+                `[BROWSER] Worker ${workerIndex}: page crash event received.`,
+            );
+        });
+
+        context.on("close", () => {
+            console.error(
+                `[BROWSER] Worker ${workerIndex}: browser context closed.`,
+            );
+        });
+
         await warmUpProxy(page, workerIndex);
 
         return { context, page, userDataDir };
@@ -4246,6 +4186,118 @@ async function launchSmartProxyBrowser(workerIndex) {
         throw error;
     }
 }
+function isRecoverableBrowserError(error) {
+    const message = String(
+        error?.message || error || "",
+    );
+
+    return (
+        /ERR_TIMED_OUT/i.test(message) ||
+        /ERR_TUNNEL_CONNECTION_FAILED/i.test(message) ||
+        /ERR_PROXY_CONNECTION_FAILED/i.test(message) ||
+        /ERR_CONNECTION_RESET/i.test(message) ||
+        /ERR_CONNECTION_CLOSED/i.test(message) ||
+        /ERR_NETWORK_CHANGED/i.test(message) ||
+        /Target page, context or browser has been closed/i.test(message) ||
+        /browser has disconnected/i.test(message) ||
+        /Navigation failed because page was closed/i.test(message)
+    );
+}
+
+
+/**
+ * Completely replace the current browser/page after a network/navigation
+ * failure.
+ *
+ * Smartproxy mode:
+ *   - close the poisoned page
+ *   - close the persistent context
+ *   - delete its temporary Chromium profile
+ *   - launch a brand-new persistent context through the same worker proxy
+ *
+ * Multilogin mode:
+ *   - leave the externally-owned context alive
+ *   - close only our page
+ *   - create a fresh page in that context
+ */
+async function recoverWorkerBrowser(
+    session,
+    workerIndex,
+    reason,
+) {
+    console.warn(
+        `[RECOVERY] Worker ${workerIndex}: rebuilding browser ` +
+        `after ${reason}`,
+    );
+
+    if (BROWSER_MODE === "multilogin") {
+        await session.page?.close().catch(() => {});
+
+        session.page =
+            await session.context.newPage();
+
+        session.page.setDefaultTimeout(30_000);
+        session.page.setDefaultNavigationTimeout(60_000);
+
+        await session.page.addInitScript(
+            TURNSTILE_INIT_SCRIPT,
+        );
+
+        console.log(
+            `[RECOVERY] Worker ${workerIndex}: ` +
+            `fresh Multilogin page ready.`,
+        );
+
+        return;
+    }
+
+    const oldUserDataDir =
+        session.userDataDir;
+
+    await session.page?.close().catch(() => {});
+    await session.context?.close().catch(() => {});
+
+    session.page = null;
+    session.context = null;
+    session.userDataDir = null;
+
+    await removeTempArtifact(
+        oldUserDataDir,
+        `worker ${workerIndex} failed Chromium profile`,
+    );
+
+    /*
+     * launchSmartProxyBrowser() creates:
+     *   - a completely new persistent Chromium context
+     *   - a fresh page
+     *   - a fresh temporary profile
+     *   - the worker's configured proxy connection
+     *
+     * It also performs the existing proxy warm-up.
+     */
+    const fresh =
+        await launchSmartProxyBrowser(
+            workerIndex,
+        );
+
+    session.context = fresh.context;
+    session.page = fresh.page;
+    session.userDataDir =
+        fresh.userDataDir;
+
+    console.log(
+        `[RECOVERY] Worker ${workerIndex}: ` +
+        `fresh Smartproxy browser ready.`,
+    );
+}
+
+function isBrowserCrashError(error) {
+    const message = String(error?.message || error || "");
+
+    return /page crashed|target crashed|err_aborted|browser.*closed|context.*closed|page.*closed|has been closed|crsession|connection.*closed|protocol error/i.test(
+        message,
+    );
+}
 
 function chunkRoundRobin(items, k) {
     const batches = Array.from({ length: k }, () => []);
@@ -4255,7 +4307,13 @@ function chunkRoundRobin(items, k) {
 
 // The per-worker row loop. Returns totals; does NOT close the browser or
 // the pool - the caller (runWorker) owns those.
-async function runEnrichmentLoop(page, rows, workerIndex) {
+// The per-worker row loop. Returns totals; does NOT close the browser or
+// the pool - the caller (runWorker) owns those.
+async function runEnrichmentLoop(
+    session,
+    rows,
+    workerIndex,
+) {
     const totals = {
         updated: 0,
         invalid_name: 0,
@@ -4266,7 +4324,11 @@ async function runEnrichmentLoop(page, rows, workerIndex) {
         failed: 0,
     };
 
-    for (let index = 0; index < rows.length; index += 1) {
+    for (
+        let index = 0;
+        index < rows.length;
+        index += 1
+    ) {
         const row = rows[index];
 
         console.log(
@@ -4277,15 +4339,52 @@ async function runEnrichmentLoop(page, rows, workerIndex) {
         let result = null;
         let handled = false;
 
-        for (let attempt = 1; attempt <= 2; attempt += 1) {
+        for (
+            let attempt = 1;
+            attempt <= 2;
+            attempt += 1
+        ) {
             try {
-                result = await enrichOneRow(page, row);
+                result =
+                    await enrichOneRow(
+                        session.page,
+                        row,
+                    );
+
+                /*
+                 * enrichOneRow() can return status:"failed" when every
+                 * candidate detail page failed to open.
+                 *
+                 * That usually means the page/context is no longer healthy.
+                 * On the first occurrence, rebuild Chromium and retry THIS
+                 * SAME ROW before moving to another lead.
+                 */
+                if (
+                    result?.status === "failed" &&
+                    attempt === 1
+                ) {
+                    console.warn(
+                        `[RECOVERY] ID ${row.id}: FTN lookup ` +
+                        `returned failed. Rebuilding browser before retry.`,
+                    );
+
+                    await recoverWorkerBrowser(
+                        session,
+                        workerIndex,
+                        `FTN lookup failure on ID ${row.id}`,
+                    );
+
+                    result = null;
+                    continue;
+                }
+
                 handled = true;
                 break;
             } catch (error) {
                 console.error(
                     `[ERROR] ID ${row.id} failed ` +
-                    `(attempt ${attempt}/2): ${error.message}`,
+                    `(attempt ${attempt}/2): ` +
+                    `${error.message}`,
                 );
 
                 const looksLikeCaptcha =
@@ -4293,15 +4392,58 @@ async function runEnrichmentLoop(page, rows, workerIndex) {
                         error.message,
                     );
 
-                if (looksLikeCaptcha && attempt === 1) {
-                    await ensureCaptchaSolved(page).catch(
-                        (e) => {
-                            console.error(
-                                `   retry clear-up failed: ${e.message}`,
-                            );
-                        },
+                const recoverableBrowserError =
+                    isRecoverableBrowserError(
+                        error,
                     );
-                    continue;
+
+                /*
+                 * Keep the existing CAPTCHA cleanup behavior first.
+                 */
+                if (
+                    looksLikeCaptcha &&
+                    attempt === 1
+                ) {
+                    let captchaRecovered = false;
+
+                    try {
+                        await ensureCaptchaSolved(
+                            session.page,
+                        );
+
+                        captchaRecovered = true;
+                    } catch (captchaError) {
+                        console.error(
+                            `   retry clear-up failed: ` +
+                            `${captchaError.message}`,
+                        );
+                    }
+
+                    if (captchaRecovered) {
+                        continue;
+                    }
+                }
+
+                /*
+                 * Navigation/proxy/browser failure:
+                 *
+                 * Throw the entire current browser state away.
+                 */
+                if (recoverableBrowserError) {
+                    await recoverWorkerBrowser(
+                        session,
+                        workerIndex,
+                        `${error.message} on ID ${row.id}`,
+                    );
+
+                    /*
+                     * Attempt 1 gets retried using the fresh browser.
+                     * Attempt 2 is recorded as failed, but we still rebuilt
+                     * the browser above so the NEXT lead starts clean.
+                     */
+                    if (attempt === 1) {
+                        continue;
+                    }
                 }
 
                 totals.failed += 1;
@@ -4313,53 +4455,91 @@ async function runEnrichmentLoop(page, rows, workerIndex) {
             totals[result.status] =
                 (totals[result.status] || 0) + 1;
 
-            // Phase 2: persist the outcome. On success, the familytreenow INSERT
-            // must succeed BEFORE the lead is marked 'enriched' - if the insert
-            // throws we leave the lead unmarked so it retries (never a stray
-            // 'enriched' mark without a captured row). Invalid names and
-            // no-phone outcomes are terminal. Location and no-match outcomes
-            // remain unmarked so they can be retried on a later run.
+            /*
+             * Phase 2 persistence.
+             */
             try {
-                if (result.status === "updated") {
-                    const routed = await routeContractors(
-                        row.lead_type,
-                        result.searchCity,
-                        result.searchState || row.state,
-                    );
+                if (
+                    result.status ===
+                    "updated"
+                ) {
+                    const routed =
+                        await routeContractors(
+                            row.lead_type,
+                            result.searchCity,
+                            result.searchState ||
+                            row.state,
+                        );
 
-                    // INSERT first; only mark 'enriched' if it did not throw.
+                    /*
+                     * INSERT first.
+                     *
+                     * Only mark the source row enriched after the
+                     * familytreenow INSERT succeeds.
+                     */
                     await insertFamilyTreeNowRow({
                         leadId: row.id,
-                        description: row.description,
-                        author: result.personName || row.author,
-                        city: result.searchCity,
-                        state: result.searchState ||
-                            cleanText(row.state).toUpperCase(),
-                        address: result.address ?? null,
-                        phone: result.phone,
-                        companyNames: routed.companyNames,
-                        phones: routed.phones,
-                        leadType: row.lead_type,
+                        description:
+                        row.description,
+                        author:
+                            result.personName ||
+                            row.author,
+                        city:
+                        result.searchCity,
+                        state:
+                            result.searchState ||
+                            cleanText(
+                                row.state,
+                            ).toUpperCase(),
+                        address:
+                            result.address ??
+                            null,
+                        phone:
+                        result.phone,
+                        companyNames:
+                        routed.companyNames,
+                        phones:
+                        routed.phones,
+                        leadType:
+                        row.lead_type,
                     });
 
-                    await markLeadProcessed(row.id, "enriched");
+                    await markLeadProcessed(
+                        row.id,
+                        "enriched",
+                    );
 
                     console.log(
                         `[DB] ID ${row.id}: familytreenow row inserted ` +
                         `(${routed.phones.length} contractor(s) routed).`,
                     );
-                } else if (result.status === "no_matching_result") {
+                } else if (
+                    result.status ===
+                    "no_matching_result"
+                ) {
                     console.log(
                         `[RETRY] ID ${row.id}: no matching FTN result. ` +
                         `Leaving the row pending for a later run.`,
                     );
-                } else if (result.status === "no_mobile_phone") {
-                    await markLeadProcessed(row.id, "no_phone");
-                } else if (result.status === "invalid_name") {
-                    // Unusable name for a lookup; mark so it is not re-picked.
-                    await markLeadProcessed(row.id, "invalid_name");
                 } else if (
-                    result.status === "location_not_selected"
+                    result.status ===
+                    "no_mobile_phone"
+                ) {
+                    await markLeadProcessed(
+                        row.id,
+                        "no_phone",
+                    );
+                } else if (
+                    result.status ===
+                    "invalid_name"
+                ) {
+                    await markLeadProcessed(
+                        row.id,
+                        "invalid_name",
+                    );
+                } else if (
+                    result.status ===
+                    "location_not_selected"
                 ) {
                     console.log(
                         `[RETRY] ID ${row.id}: location was not accepted by ` +
@@ -4368,22 +4548,42 @@ async function runEnrichmentLoop(page, rows, workerIndex) {
                 }
             } catch (dbError) {
                 console.error(
-                    `[ERROR] ID ${row.id}: DB persist failed: ${dbError.message}`,
+                    `[ERROR] ID ${row.id}: DB persist failed: ` +
+                    `${dbError.message}`,
                 );
             }
 
-            // Phase 2: running success count to console (how many of how many
-            // succeeded so far for this worker). The grand total across all
-            // workers is logged by the master at the end (printGrandTotals).
-            if (result.status === "updated") {
+            if (
+                result.status ===
+                "updated"
+            ) {
                 console.log(
-                    `[STATS] Worker ${workerIndex}: ${totals.updated}/${rows.length} ` +
+                    `[STATS] Worker ${workerIndex}: ` +
+                    `${totals.updated}/${rows.length} ` +
                     `succeeded so far.`,
+                );
+            }
+
+            /*
+             * If attempt #2 also came back as status:"failed", make
+             * absolutely sure the next database row does NOT inherit the
+             * failed browser.
+             */
+            if (
+                result.status ===
+                "failed"
+            ) {
+                await recoverWorkerBrowser(
+                    session,
+                    workerIndex,
+                    `final failed result for ID ${row.id}`,
                 );
             }
         }
 
-        await sleep(randomDelay());
+        await sleep(
+            randomDelay(),
+        );
     }
 
     return totals;
@@ -4414,21 +4614,29 @@ function printWorkerTotals(totals, workerIndex) {
 }
 
 // -------------------- WORKER --------------------
+// -------------------- WORKER --------------------
 async function runWorker() {
-    const workerIndex = Number(process.env.WORKER_INDEX || 0);
-    const batchFile = process.env.FTN_BATCH_FILE;
+    const workerIndex =
+        Number(
+            process.env.WORKER_INDEX ||
+            0,
+        );
+
+    const batchFile =
+        process.env.FTN_BATCH_FILE;
 
     let rows = [];
 
     if (batchFile) {
         rows = JSON.parse(
             await fs.promises
-                .readFile(batchFile, "utf8")
+                .readFile(
+                    batchFile,
+                    "utf8",
+                )
                 .catch(() => "[]"),
         );
 
-        // The worker no longer needs its handoff file after it has been read.
-        // Delete it immediately; the master also performs fallback cleanup.
         await removeTempArtifact(
             batchFile,
             `worker ${workerIndex} batch file`,
@@ -4440,70 +4648,124 @@ async function runWorker() {
         `(${rows.length} row(s), mode ${BROWSER_MODE}).`,
     );
 
-    let context;
-    let page;
-    let userDataDir = null;
+    /*
+     * Mutable browser holder.
+     *
+     * recoverWorkerBrowser() can replace these values while the
+     * enrichment loop is running.
+     */
+    const session = {
+        context: null,
+        page: null,
+        userDataDir: null,
+    };
 
     try {
-        if (BROWSER_MODE === "multilogin") {
-            if (!process.env.MULTILOGIN_WS) {
-                throw new Error("MULTILOGIN_WS is missing.");
+        if (
+            BROWSER_MODE ===
+            "multilogin"
+        ) {
+            if (
+                !process.env.MULTILOGIN_WS
+            ) {
+                throw new Error(
+                    "MULTILOGIN_WS is missing.",
+                );
             }
 
-            const browser = await chromium.connectOverCDP(
-                process.env.MULTILOGIN_WS,
-            );
-            context = browser.contexts()[0];
+            const browser =
+                await chromium.connectOverCDP(
+                    process.env.MULTILOGIN_WS,
+                );
 
-            if (!context) {
+            session.context =
+                browser.contexts()[0];
+
+            if (!session.context) {
                 throw new Error(
                     "No Multilogin browser context found.",
                 );
             }
 
-            page = await context.newPage();
-            page.setDefaultTimeout(30_000);
-            page.setDefaultNavigationTimeout(60_000);
-            await page.addInitScript(TURNSTILE_INIT_SCRIPT);
+            session.page =
+                await session.context.newPage();
+
+            session.page.setDefaultTimeout(
+                30_000,
+            );
+
+            session.page
+                .setDefaultNavigationTimeout(
+                    60_000,
+                );
+
+            await session.page.addInitScript(
+                TURNSTILE_INIT_SCRIPT,
+            );
         } else {
-            ({ context, page, userDataDir } =
-                await launchSmartProxyBrowser(workerIndex));
+            const launched =
+                await launchSmartProxyBrowser(
+                    workerIndex,
+                );
+
+            session.context =
+                launched.context;
+
+            session.page =
+                launched.page;
+
+            session.userDataDir =
+                launched.userDataDir;
         }
 
-        const totals = await runEnrichmentLoop(
-            page,
-            rows,
+        const totals =
+            await runEnrichmentLoop(
+                session,
+                rows,
+                workerIndex,
+            );
+
+        printWorkerTotals(
+            totals,
             workerIndex,
         );
-        printWorkerTotals(totals, workerIndex);
 
-        // Report totals back to the master process (if IPC is available) so
-        // the master can print a grand success count across all workers.
-        if (typeof process.send === "function") {
+        if (
+            typeof process.send ===
+            "function"
+        ) {
             process.send({
                 type: "totals",
                 workerIndex,
-                rowsProcessed: rows.length,
+                rowsProcessed:
+                rows.length,
                 totals,
             });
         }
     } finally {
-        await page?.close().catch(() => {});
+        await session.page
+            ?.close()
+            .catch(() => {});
 
-        // Only the Smartproxy context is ours to close; Multilogin owns its.
-        if (BROWSER_MODE !== "multilogin") {
-            await context?.close().catch(() => {});
+        /*
+         * Only Smartproxy Chromium belongs to us.
+         */
+        if (
+            BROWSER_MODE !==
+            "multilogin"
+        ) {
+            await session.context
+                ?.close()
+                .catch(() => {});
 
-            // launchPersistentContext does NOT delete its userDataDir on close.
-            // Remove the complete disposable Chromium profile after every
-            // worker so repeated /run requests cannot fill /tmp.
             await removeTempArtifact(
-                userDataDir,
+                session.userDataDir,
                 `worker ${workerIndex} Chromium profile`,
             );
         }
 
-        await pool.end().catch(() => {});
+        await pool.end()
+            .catch(() => {});
     }
 }
 
@@ -4513,7 +4775,7 @@ async function runMaster() {
         " FamilyTreeNow General Contracting Enrichment (master) Started",
     );
     console.log(
-        ` Build: RESULT_CITY_MATCH_V7 - workers: ${WORKER_COUNT} - ` +
+        ` Build: RESULT_CITY_MATCH_V8_BROWSER_RECOVERY - workers: ${WORKER_COUNT} - ` +
         `mode: ${BROWSER_MODE}`,
     );
 
@@ -4612,15 +4874,33 @@ async function runMaster() {
         `${exitCodes.join(", ")}`,
     );
 
-    printGrandTotals(workerReports, rows.length);
+    const grand = printGrandTotals(workerReports, rows.length);
+
+    const workerFailed = exitCodes.some(
+        (code) => code !== 0,
+    );
+
+    const systemicFailure = Boolean(
+        grand &&
+        grand.updated === 0 &&
+        grand.failed >= Math.max(3, Math.ceil(rows.length * 0.5)),
+    );
 
     await pool.end().catch(() => {});
+
+    if (workerFailed || systemicFailure) {
+        throw new Error(
+            `FTN enrichment failed: workerFailed=${workerFailed}, ` +
+            `updated=${grand?.updated || 0}, failed=${grand?.failed || 0}, ` +
+            `loaded=${rows.length}.`,
+        );
+    }
 }
 
 // Aggregate per-worker totals into a grand success count and log it.
 function printGrandTotals(reports, totalRowsLoaded) {
     if (!reports.length) {
-        return;
+        return null;
     }
 
     const grand = {
@@ -4668,6 +4948,8 @@ function printGrandTotals(reports, totalRowsLoaded) {
     console.log(
         "============================================================",
     );
+
+    return grand;
 }
 
 if (require.main === module) {
