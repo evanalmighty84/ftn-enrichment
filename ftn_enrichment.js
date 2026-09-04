@@ -4202,6 +4202,8 @@ function isRecoverableBrowserError(error) {
     );
 
     return (
+        /Page crashed/i.test(message) ||
+        /ERR_ABORTED/i.test(message) ||
         /ERR_TIMED_OUT/i.test(message) ||
         /ERR_TUNNEL_CONNECTION_FAILED/i.test(message) ||
         /ERR_PROXY_CONNECTION_FAILED/i.test(message) ||
