@@ -148,7 +148,31 @@ HOME / PROPERTY SERVICES:
 General contracting, decks, fences, remodeling, additions, roofing, siding, restoration, foundation, garage work, plumbing, electrical, HVAC, gutters, windows, doors, drywall, tile, flooring, painting, staining, lighting, generators, lawn care, landscaping, tree work, house cleaning, handyman services, pest control, junk removal, pools, power washing, exterior lighting, Christmas lights, mold remediation, and other supported home/property services.
 
 INSURANCE:
-Posts involving home insurance, homeowners insurance, auto insurance, renters insurance, insurance shopping, comparing rates or coverage, looking for an insurance agent, asking for an insurance recommendation, problems obtaining coverage, questions about coverage, filing or considering filing an insurance claim, or needing help with an insurance-related issue.
+Posts where the author is actively looking to purchase, replace, compare, or improve home insurance, homeowners insurance, auto insurance, car insurance, renters insurance, or bundled home and auto coverage.
+
+Include posts where the author is:
+- Looking for an insurance agent or broker
+- Asking for insurance company recommendations
+- Shopping for a new policy
+- Comparing insurance rates, quotes, carriers, or coverage
+- Looking for cheaper or better insurance
+- Trying to switch insurance companies
+- Complaining about a premium increase AND asking for alternatives, quotes, recommendations, or another carrier
+- Having difficulty obtaining coverage and looking for an agent, broker, carrier, or policy
+- Asking for recommendations for home, auto, renters, or bundled insurance
+
+Do NOT classify a post as an insurance lead merely because insurance is mentioned.
+
+Exclude posts where:
+- The author is primarily asking for a lawyer or legal advice
+- The author is discussing an existing insurance claim but is not looking for a new policy, agent, broker, quote, or carrier
+- The author is only complaining about an insurance company or insurance prices
+- The author is discussing insurance news, politics, fees, regulations, or general opinions
+- The author is recommending, praising, or reviewing an insurance company without seeking insurance
+- An insurance agent or company is advertising or promoting their own services
+- The post is about Medicare, health insurance, or a home warranty rather than home, auto, or renters insurance
+
+When another professional service is explicitly requested and insurance is only part of the context, classify the post under the requested service instead of insurance.
 
 HOME CARE / SENIOR CARE:
 Posts involving a need for help caring for the author or another person, including a parent, spouse, relative, elderly person, disabled person, or someone needing assistance at home.
