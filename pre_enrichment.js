@@ -61,6 +61,30 @@ if (!ALLOWED_SOURCE_TABLES.has(TABLE_NAME)) {
 }
 
 console.log(`[ftn] using source table: ${TABLE_NAME}`);
+const TARGET_IDS = String(
+    process.env.FTN_TARGET_IDS || "",
+)
+    .split(",")
+    .map((value) => Number(value.trim()))
+    .filter(
+        (value) =>
+            Number.isSafeInteger(value) &&
+            value > 0,
+    );
+
+const IS_TARGETED_RUN = TARGET_IDS.length > 0;
+
+if (IS_TARGETED_RUN) {
+    console.log(
+        `[ftn] targeted pre-enrichment for ` +
+        `${TARGET_IDS.length} ID(s): ` +
+        TARGET_IDS.join(", "),
+    );
+} else {
+    console.log(
+        "[ftn] normal pre-enrichment batch mode",
+    );
+}
 
 /* ---------------- Perplexity Sonar config ---------------- */
 const PPLX_API_URL =
@@ -464,8 +488,34 @@ async function main() {
         `minutesBack=${minutesBack} limit=${limit}`,
     );
 
-    const { rows } = await pool.query(
-        `
+    let rows;
+
+    if (IS_TARGETED_RUN) {
+        const result = await pool.query(
+            `
+            SELECT
+                id,
+                author,
+                description,
+                city,
+                state
+            FROM ${TABLE_NAME}
+            WHERE id = ANY($1::int[])
+              AND enrichment = false
+            ORDER BY created_at ASC
+        `,
+            [TARGET_IDS],
+        );
+
+        rows = result.rows;
+
+        console.log(
+            `[ftn] targeted pre-enrichment loaded ` +
+            `${rows.length} row(s).`,
+        );
+    } else {
+        const result = await pool.query(
+            `
             SELECT
                 id,
                 author,
@@ -479,8 +529,11 @@ async function main() {
             ORDER BY created_at ASC
             LIMIT $2
         `,
-        [minutesBack, limit],
-    );
+            [minutesBack, limit],
+        );
+
+        rows = result.rows;
+    }
 
     if (rows.length === 0) {
         console.log(

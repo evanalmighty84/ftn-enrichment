@@ -58,6 +58,7 @@ const workflowQueue = [];
 let workflowProcess = null;
 let workflowStage = null;
 let workflowSourceTable = null;
+let workflowTargetIds = [];
 let workflowStartedAt = null;
 let workflowDeadlineAt = null;
 let workflowTimedOut = false;
@@ -94,7 +95,41 @@ function resolveSourceTable(value) {
 
     return sourceTable;
 }
+function resolveTargetIds(value) {
+    if (value === undefined || value === null) {
+        return [];
+    }
 
+    if (!Array.isArray(value)) {
+        throw new Error("ids must be an array of integers.");
+    }
+
+    const ids = [...new Set(
+        value.map((id) => Number(id))
+    )];
+
+    if (
+        ids.length === 0 ||
+        !ids.every(
+            (id) =>
+                Number.isSafeInteger(id) &&
+                id > 0
+        )
+    ) {
+        throw new Error(
+            "ids must contain one or more positive integers.",
+        );
+    }
+
+    // Prevent an accidental massive targeted request.
+    if (ids.length > 500) {
+        throw new Error(
+            "A maximum of 500 custom ids may be submitted.",
+        );
+    }
+
+    return ids;
+}
 function readJsonBody(req) {
     return new Promise((resolve, reject) => {
         let rawBody = "";
@@ -187,23 +222,52 @@ function getQueueSnapshot() {
     return workflowQueue.map((item, index) => ({
         position: index + 1,
         source_table: item.sourceTable,
+        ids: item.targetIds.length
+            ? item.targetIds
+            : null,
+        id_count: item.targetIds.length,
         queued_at: item.queuedAt,
     }));
 }
+function workflowKey(sourceTable, targetIds = []) {
+    const idPart = targetIds.length
+        ? [...targetIds].sort((a, b) => a - b).join(",")
+        : "ALL";
 
-function getQueuedPosition(sourceTable) {
-    const index = workflowQueue.findIndex(
-        (item) => item.sourceTable === sourceTable,
-    );
-
-    return index === -1 ? null : index + 1;
+    return `${sourceTable}:${idPart}`;
 }
 
-function enqueueWorkflow(sourceTable) {
+function getQueuedPosition(sourceTable, targetIds = []) {
+    const requestedKey =
+        workflowKey(sourceTable, targetIds);
+
+    const index = workflowQueue.findIndex(
+        (item) =>
+            workflowKey(
+                item.sourceTable,
+                item.targetIds,
+            ) === requestedKey,
+    );
+
+    return index === -1
+        ? null
+        : index + 1;
+}
+
+function enqueueWorkflow(
+    sourceTable,
+    targetIds = [],
+) {
     if (
         isRunning() &&
-        workflowSourceTable === sourceTable
-    ) {
+        workflowKey(
+            workflowSourceTable,
+            workflowTargetIds,
+        ) === workflowKey(
+            sourceTable,
+            targetIds,
+        )
+    )  {
         return {
             status: "already_running",
             position: 0,
@@ -211,7 +275,10 @@ function enqueueWorkflow(sourceTable) {
     }
 
     const existingPosition =
-        getQueuedPosition(sourceTable);
+        getQueuedPosition(
+            sourceTable,
+            targetIds,
+        );
 
     if (existingPosition !== null) {
         return {
@@ -222,6 +289,7 @@ function enqueueWorkflow(sourceTable) {
 
     workflowQueue.push({
         sourceTable,
+        targetIds,
         queuedAt: new Date().toISOString(),
     });
 
@@ -274,6 +342,7 @@ function clearWorkflowState(child = null) {
     workflowProcess = null;
     workflowStage = null;
     workflowSourceTable = null;
+    workflowTargetIds = [];
     workflowStartedAt = null;
     workflowDeadlineAt = null;
     workflowTimedOut = false;
@@ -338,7 +407,10 @@ function startNextQueuedWorkflow() {
     );
 
     try {
-        startWorkflow(next.sourceTable);
+        startWorkflow(
+            next.sourceTable,
+            next.targetIds,
+        );
     } catch (error) {
         console.error(
             `❌ Could not start queued workflow for ` +
@@ -432,6 +504,7 @@ function armWorkflowTimeout(
 
 function spawnWorkflowStage({
                                 sourceTable,
+                                targetIds = [],
                                 stage,
                                 scriptPath,
                                 successMessage,
@@ -439,6 +512,7 @@ function spawnWorkflowStage({
                             }) {
     workflowStage = stage;
     workflowSourceTable = sourceTable;
+    workflowTargetIds = targetIds;
 
     const child = spawn(
         process.execPath,
@@ -448,6 +522,11 @@ function spawnWorkflowStage({
             env: {
                 ...process.env,
                 FTN_SOURCE_TABLE: sourceTable,
+
+                // Empty string means normal unrestricted batch mode.
+                FTN_TARGET_IDS: targetIds.length
+                    ? targetIds.join(",")
+                    : "",
             },
             stdio: "inherit",
 
@@ -554,13 +633,17 @@ function spawnWorkflowStage({
     return child.pid;
 }
 
-function runFtnEnrichment(sourceTable) {
+function runFtnEnrichment(
+    sourceTable,
+    targetIds = [],
+) {
     console.log(
         `▶️ Starting ftn_enrichment.js for ${sourceTable}...`,
     );
 
     return spawnWorkflowStage({
         sourceTable,
+        targetIds,
         stage: "ftn_enrichment",
         scriptPath: FTN_ENRICHMENT_SCRIPT,
         successMessage:
@@ -569,10 +652,24 @@ function runFtnEnrichment(sourceTable) {
     });
 }
 
-function startWorkflow(sourceTable) {
+function startWorkflow(
+    sourceTable,
+    targetIds = [],
+) {
     console.log(
         `🗃️ Requested source table: ${sourceTable}`,
     );
+
+    if (targetIds.length) {
+        console.log(
+            `🎯 Targeting ${targetIds.length} custom IDs: ` +
+            targetIds.join(", "),
+        );
+    } else {
+        console.log(
+            "📋 No custom IDs supplied; using normal batch mode.",
+        );
+    }
 
     console.log(
         `▶️ Starting pre_enrichment.js for ` +
@@ -581,11 +678,16 @@ function startWorkflow(sourceTable) {
 
     return spawnWorkflowStage({
         sourceTable,
+        targetIds,
         stage: "pre_enrichment",
         scriptPath: PRE_ENRICHMENT_SCRIPT,
         successMessage:
             "✅ Preliminary script completed successfully.",
-        onSuccess: () => runFtnEnrichment(sourceTable),
+        onSuccess: () =>
+            runFtnEnrichment(
+                sourceTable,
+                targetIds,
+            ),
     });
 }
 
@@ -629,6 +731,8 @@ const server = http.createServer(
                 running: isRunning(),
                 stage: workflowStage,
                 source_table: workflowSourceTable,
+                target_ids: workflowTargetIds.length ? workflowTargetIds : null,
+                target_id_count: workflowTargetIds.length,
                 pid: workflowProcess?.pid || null,
                 started_at: workflowStartedAt,
                 deadline_at: workflowDeadlineAt,
@@ -684,10 +788,15 @@ const server = http.createServer(
         }
 
         let sourceTable;
+        let targetIds;
 
         try {
             sourceTable = resolveSourceTable(
                 body.source_table,
+            );
+
+            targetIds = resolveTargetIds(
+                body.ids,
             );
         } catch (error) {
             sendJson(res, 400, {
@@ -703,7 +812,10 @@ const server = http.createServer(
 
         if (isRunning()) {
             const queueResult =
-                enqueueWorkflow(sourceTable);
+                enqueueWorkflow(
+                    sourceTable,
+                    targetIds,
+                );
 
             if (
                 queueResult.status ===
@@ -781,7 +893,10 @@ const server = http.createServer(
         let pid;
 
         try {
-            pid = startWorkflow(sourceTable);
+            pid = startWorkflow(
+                sourceTable,
+                targetIds,
+            );
         } catch (error) {
             clearWorkflowState();
 
@@ -808,6 +923,17 @@ const server = http.createServer(
                 "FTN enrichment will run after it completes.",
             stage: workflowStage,
             source_table: sourceTable,
+
+            ids: targetIds.length
+                ? targetIds
+                : null,
+
+            id_count: targetIds.length,
+
+            mode: targetIds.length
+                ? "targeted"
+                : "normal",
+
             pid,
             started_at: workflowStartedAt,
             deadline_at: workflowDeadlineAt,

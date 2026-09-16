@@ -97,6 +97,31 @@ const POLYGON_CITY_COORDS = new Map();
 
 console.log(`[DB] FTN source table: ${TABLE_NAME}`);
 
+const TARGET_IDS = String(
+    process.env.FTN_TARGET_IDS || "",
+)
+    .split(",")
+    .map((value) => Number(value.trim()))
+    .filter(
+        (value) =>
+            Number.isSafeInteger(value) &&
+            value > 0,
+    );
+
+const IS_TARGETED_RUN = TARGET_IDS.length > 0;
+
+if (IS_TARGETED_RUN) {
+    console.log(
+        `🎯 Targeted FTN enrichment for ` +
+        `${TARGET_IDS.length} ID(s): ` +
+        TARGET_IDS.join(", "),
+    );
+} else {
+    console.log(
+        "📋 FTN enrichment running in normal batch mode.",
+    );
+}
+
 const FTN_HOME_URL =
     "https://www.familytreenow.com/";
 
@@ -760,12 +785,41 @@ function parseReportedDate(text = "") {
 }
 
 async function getRowsToEnrich() {
-    // Phase 2: target only Sonar-confirmed leads (is_lead=true, set by Phase 1)
-    // that Phase 2 has not yet processed. We use ftn_enriched_at (timestamptz),
-    // a dedicated Phase-2-owned column, as the processed marker - NOT enriched_at
-    // / enrichment_status / enrichment, which Phase 1 owns. Newest rows first
-    // (id DESC) so fresh leads are prioritized. author/city/state must be present
-    // for a lookup. lead_type feeds contractor routing on insert.
+    // Targeted mode:
+    // Only consider explicitly requested IDs.
+    // Keep the normal lead + FTN pending safeguards.
+    if (IS_TARGETED_RUN) {
+        const { rows } = await pool.query(
+            `
+                SELECT
+                    id,
+                    author,
+                    description,
+                    city,
+                    state,
+                    lead_type
+                FROM ${TABLE_NAME}
+                WHERE id = ANY($1::int[])
+                  AND is_lead = true
+                  AND ftn_enriched_at IS NULL
+                  AND author IS NOT NULL
+                  AND city IS NOT NULL
+                  AND state IS NOT NULL
+                ORDER BY id DESC
+            `,
+            [TARGET_IDS],
+        );
+
+        console.log(
+            `🎯 Loaded ${rows.length} of ` +
+            `${TARGET_IDS.length} targeted ID(s) ` +
+            `eligible for FTN enrichment.`,
+        );
+
+        return rows;
+    }
+
+    // Normal automated mode — unchanged.
     const { rows } = await pool.query(
         `
             SELECT
@@ -776,20 +830,18 @@ async function getRowsToEnrich() {
                 state,
                 lead_type
             FROM ${TABLE_NAME}
-            WHERE is_lead = TRUE
+            WHERE is_lead = true
               AND ftn_enriched_at IS NULL
               AND author IS NOT NULL
               AND city IS NOT NULL
               AND state IS NOT NULL
-              AND timestamp >= NOW() - ($2::integer * INTERVAL '1 minute')
             ORDER BY id DESC
                 LIMIT $1
         `,
-        [MAX_ROWS, MINUTES_BACK],
+        [MAX_ROWS],
     );
 
     return rows;
-
 }
 
 // Mark a lead as processed by Phase 2 so it is never re-picked. Writes the
