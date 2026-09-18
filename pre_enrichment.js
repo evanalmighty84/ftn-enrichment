@@ -105,11 +105,13 @@ const PPLX_BATCH_SIZE = parseInt(
    array.
 */
 const ALLOWED_LEAD_TYPES = [
+    "auto_body",
     "bookkeeper",
     "christmas_lights",
     "commercial_lending",
     "concrete",
     "dentist",
+    "doors",
     "electrician",
     "fencing",
     "garage",
@@ -134,6 +136,7 @@ const ALLOWED_LEAD_TYPES = [
     "power_washing",
     "realtor",
     "roofer",
+    "siding",
     "security",
     "windows",
 ];
@@ -213,6 +216,17 @@ IRS or back-tax assistance, payroll help, accounts-payable help, or similar
 business/personal financial-record support.
 
 These should use the lead_type "bookkeeper".
+
+AUTOMOTIVE BODY / COLLISION:
+Posts involving an unresolved need for auto body repair, collision repair, dent repair, scratches, bumpers, fenders, quarter panels, frame damage, hail damage, vehicle paint or refinishing, clear coat problems, exterior mirrors, body-shop recommendations, or mobile dent/body repair.
+
+These posts should use the lead_type "auto_body".
+
+Examples include someone looking for a body shop, asking who can pull a dent, needing bumper or quarter-panel work, looking for hail-damage repair, needing vehicle repainting or paint matching, asking for mobile dent repair, or describing unresolved exterior collision damage.
+
+Do not classify engine, transmission, brake, battery, tire, oil-change, tune-up, diagnostic, or other mechanical repair requests as auto_body.
+
+Do not classify an automotive body post as general_contractor or handyman merely because it involves repair. Use "auto_body" when the underlying need is vehicle body, collision, paint, dent, or exterior cosmetic repair.
 
 REAL ESTATE / REALTOR:
 Posts involving someone looking to buy, sell, rent, relocate, move, find a realtor, find a real-estate agent, ask questions about buying or selling, evaluate whether to sell, or otherwise showing an unresolved real-estate need.
