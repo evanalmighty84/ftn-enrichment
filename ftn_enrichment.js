@@ -1531,7 +1531,47 @@ async function chooseExactCityStateSuggestion(
     }
 
     console.log(
-        `[SKIP] Exact autocomplete location was not offered: ${target}`,
+        `[WARN] Exact autocomplete location was not offered: ${target}`,
+    );
+
+    const visibleSuggestions =
+        await getVisibleAutocompleteTexts(page);
+
+    console.log(
+        `[DEBUG] Final visible city suggestions for "${target}": ` +
+        `${visibleSuggestions.join(" | ") || "(none)"}`,
+    );
+
+    console.log(
+        `[FALLBACK] Typing "${target}" directly into city/state field.`,
+    );
+
+    await cityStateInput.click().catch(() => {});
+    await cityStateInput.fill(target).catch(() => {});
+
+    await page.keyboard.press("Tab").catch(() => {});
+    await sleep(1200);
+
+    const fallbackValue = cleanText(
+        await cityStateInput
+            .inputValue()
+            .catch(() => ""),
+    );
+
+    console.log(
+        `[FALLBACK] City/state field now contains: "${fallbackValue}"`,
+    );
+
+    if (targetRegex.test(fallbackValue)) {
+        console.log(
+            `[OK] Direct city/state fallback retained: ${target}`,
+        );
+
+        return true;
+    }
+
+    console.log(
+        `[SKIP] City/state fallback failed for: ${target}`,
     );
 
     return false;
