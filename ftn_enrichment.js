@@ -786,6 +786,27 @@ function parseReportedDate(text = "") {
     return Number.isFinite(parsed) ? parsed : null;
 }
 
+function isRecentReportedPhone(
+    reportedAt,
+    months = 3,
+) {
+    if (!reportedAt) {
+        return false;
+    }
+
+    const now = new Date();
+
+    // Current month + previous 2 months.
+    // Example: September 2026 -> cutoff July 1, 2026.
+    const cutoff = new Date(
+        now.getFullYear(),
+        now.getMonth() - (months - 1),
+        1,
+    ).getTime();
+
+    return reportedAt >= cutoff;
+}
+
 async function getRowsToEnrich() {
     // Targeted mode:
     // Only consider explicitly requested IDs.
@@ -3534,24 +3555,31 @@ async function extractWirelessPhoneCandidates(page) {
         }
     }
 
-    return [...unique.values()].sort((a, b) => {
-        const dateDifference =
-            (b.reportedAt || 0) -
-            (a.reportedAt || 0);
+    return [...unique.values()]
+        .filter((candidate) =>
+            isRecentReportedPhone(
+                candidate.reportedAt,
+                3,
+            ),
+        )
+        .sort((a, b) => {
+            const dateDifference =
+                (b.reportedAt || 0) -
+                (a.reportedAt || 0);
 
-        if (dateDifference !== 0) {
-            return dateDifference;
-        }
+            if (dateDifference !== 0) {
+                return dateDifference;
+            }
 
-        if (
-            Boolean(a.possiblePrimary) !==
-            Boolean(b.possiblePrimary)
-        ) {
-            return a.possiblePrimary ? -1 : 1;
-        }
+            if (
+                Boolean(a.possiblePrimary) !==
+                Boolean(b.possiblePrimary)
+            ) {
+                return a.possiblePrimary ? -1 : 1;
+            }
 
-        return a.context.length - b.context.length;
-    });
+            return a.context.length - b.context.length;
+        });
 }
 
 // Fallback extractor: collect EVERY phone-shaped number on the detail page
@@ -3991,7 +4019,7 @@ async function enrichOneRowAtLocation(
 
     // No wireless number anywhere - fall back to the first available number
     // of any type (voip/landline) so the row is still enriched.
-    if (fallbackChoice) {
+ /*   if (fallbackChoice) {
         console.log(
             `[OK] ID ${row.id}: found phone ${fallbackChoice.phone}` +
             ` (${fallbackChoice.type})` +
@@ -4007,8 +4035,18 @@ async function enrichOneRowAtLocation(
             searchState,
             address: null,
         };
-    }
+    }*/
 
+
+    if (fallbackChoice) {
+        console.log(
+            `[SKIP] Only non-wireless or stale phone numbers were found ` +
+            `for ${person.fullName}.`,
+        );
+        return {
+            status: "no_mobile_phone",
+        };
+    }
     console.log(
         `[INFO] No Wireless/Mobile phone found for ` +
         `${person.fullName} (tried ${maxAttempts} result(s)).`,
