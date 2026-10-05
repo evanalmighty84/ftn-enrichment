@@ -101,9 +101,16 @@ RUN npx --yes playwright-core install chromium || \
 # ----------------------------------------------------------------------------
 COPY pre_enrichment.js ./
 COPY ftn_enrichment.js ./
+COPY fix-ftn-location-fallback.js ./
 COPY ftn-trigger-server.js ./
 COPY railway-entrypoint-ftn.sh ./
 COPY mckinney_neighborhoods_polygons.json ./
+
+# Revert the unsafe direct-text city fallback introduced on Sept. 30.
+# FTN requires a real autocomplete selection; merely retaining "City, ST"
+# in the textbox does not prove the site's underlying location was selected.
+RUN node /app/fix-ftn-location-fallback.js \
+    && node --check /app/ftn_enrichment.js
 
 RUN test -f /app/mckinney_neighborhoods_polygons.json \
     && echo "Polygon file copied successfully" \
