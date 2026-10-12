@@ -114,6 +114,7 @@ const ALLOWED_LEAD_TYPES = [
     "doors",
     "electrician",
     "fencing",
+    "flooring",
     "garage",
     "general_contractor",
     "handyman",
@@ -172,7 +173,64 @@ Advice and information-seeking posts can be leads when there is a genuine unreso
 Relevant services include:
 
 HOME / PROPERTY SERVICES:
-General contracting, decks, fences, remodeling, additions, roofing, siding, restoration, foundation, garage work, plumbing, electrical, HVAC, gutters, windows, doors, drywall, tile, flooring, painting, staining, lighting, generators, lawn care, landscaping, tree work, house cleaning, handyman services, pest control, junk removal, pools, power washing, exterior lighting, Christmas lights, mold remediation, and other supported home/property services.
+General contracting, decks, fences, flooring, remodeling, additions, roofing, siding, restoration, foundation, garage work, plumbing, electrical, HVAC, gutters, windows, doors, drywall, tile, painting, staining, lighting, generators, lawn care, landscaping, tree work, house cleaning, handyman services, pest control, junk removal, pools, power washing, exterior lighting, Christmas lights, mold remediation, and other supported home/property services.
+
+FLOORING:
+Posts involving an unresolved need for flooring installation, replacement, repair, refinishing, sanding, recoating, restoration, or other flooring work.
+
+These posts should use the lead_type "flooring".
+
+Flooring includes, but is not limited to:
+- hardwood flooring;
+- engineered wood flooring;
+- laminate flooring;
+- luxury vinyl plank or LVP;
+- vinyl flooring or vinyl plank;
+- tile flooring;
+- carpet installation or replacement;
+- removing old flooring and installing new flooring;
+- floor refinishing, sanding, staining, buffing, or recoating;
+- damaged flooring that needs repair or replacement;
+- flooring installation quotes or estimates;
+- homeowners asking for a flooring company, flooring installer, flooring contractor, or floor specialist.
+
+Examples that SHOULD be classified as "flooring":
+- "I need a referral to a flooring company."
+- "Looking for someone to replace my flooring."
+- "Need someone to install LVP in 1,300 square feet."
+- "Does anyone know a reliable vinyl flooring installer?"
+- "Looking for someone who does tile flooring."
+- "I need my engineered wood floors buffed and recoated."
+- "Who can refinish my hardwood floors?"
+- "I have carpet that needs to be replaced."
+- "Looking for quotes to remove laminate and install new flooring."
+
+Do NOT classify a flooring post only as "general_contractor", "handyman", or "interior_designer" when the author's actual unresolved need specifically includes flooring work.
+
+When flooring is one part of a larger project, multiple lead types may be appropriate.
+
+Examples:
+- A bathroom remodel involving new flooring, plumbing, and electrical work may be:
+  ["general_contractor", "flooring", "plumber", "electrician"]
+
+- A whole-home renovation that includes replacing floors may be:
+  ["general_contractor", "flooring"]
+
+- A homeowner specifically looking for an LVP installer should normally be:
+  ["flooring"]
+
+- A homeowner asking only for hardwood refinishing should normally be:
+  ["flooring"]
+
+Subfloor work may also qualify as "flooring" when the primary need involves repairing or replacing the floor system or preparing it for new flooring.
+
+Do not classify a post as a flooring lead merely because the word "floor" appears incidentally.
+
+For example:
+- "clean my floors" is normally house_cleaner, not flooring;
+- "garage floor epoxy/coating" may belong to another supported trade if that service is handled separately;
+- a home-for-sale post mentioning hardwood floors is not a flooring lead unless the author has an unresolved flooring need;
+- someone advertising their own flooring services is not a lead.
 
 INSURANCE:
 Posts where the author is actively looking to purchase, replace, compare, or improve home insurance, homeowners insurance, auto insurance, car insurance, renters insurance, or bundled home and auto coverage.
@@ -210,7 +268,9 @@ The author does NOT need to explicitly use the words "home care" or "caregiver."
 
 BOOKKEEPING / BUSINESS FINANCIAL HELP:
 Posts from business owners, self-employed people, contractors, organizations, or individuals needing help with bookkeeping, QuickBooks, bookkeeping cleanup, catching up books, reconciling accounts, categorizing transactions, financial reporting, financial dashboards, profit-and-loss reporting, bookkeeping systems, correcting bookkeeping problems, or ongoing bookkeeping support.
+
 Advice, referrals, recommendations, and questions about an unresolved bookkeeping or business-financial issue can be leads.
+
 Also include posts seeking an accountant, CPA, tax preparer, tax professional,
 IRS or back-tax assistance, payroll help, accounts-payable help, or similar
 business/personal financial-record support.
