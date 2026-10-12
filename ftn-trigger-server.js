@@ -10,6 +10,8 @@ const HOST = "::";
 
 const PRE_ENRICHMENT_SCRIPT = "/app/pre_enrichment.js";
 const FTN_ENRICHMENT_SCRIPT = "/app/ftn_enrichment.js";
+const CHAMBER_DIGEST_SCRIPT =
+    "/app/chamber_lead_digest.js";
 
 const ALLOWED_SOURCE_TABLES = new Set([
     "unfiltered_general_contracting",
@@ -20,6 +22,11 @@ const DEFAULT_SOURCE_TABLE =
     "unfiltered_general_contracting";
 
 const MAX_REQUEST_BODY_BYTES = 100_000;
+const CHAMBER_DIGEST_TIMEOUT_MS =
+    positiveIntegerFromEnv(
+        "CHAMBER_DIGEST_TIMEOUT_MS",
+        10 * 60 * 1000,
+    );
 
 function positiveIntegerFromEnv(name, fallback) {
     const value = Number(process.env[name]);
@@ -76,9 +83,38 @@ function isRunning() {
 }
 
 function getStageTimeoutMs(stage) {
-    return stage === "pre_enrichment"
-        ? PRE_ENRICHMENT_TIMEOUT_MS
-        : FTN_ENRICHMENT_TIMEOUT_MS;
+    if (stage === "pre_enrichment") {
+        return PRE_ENRICHMENT_TIMEOUT_MS;
+    }
+
+    if (stage === "chamber_digest") {
+        return CHAMBER_DIGEST_TIMEOUT_MS;
+    }
+
+    return FTN_ENRICHMENT_TIMEOUT_MS;
+}
+
+function runChamberDigest(
+    sourceTable,
+    targetIds = [],
+) {
+    console.log(
+        "▶️ Starting chamber_lead_digest.js...",
+    );
+
+    return spawnWorkflowStage({
+        sourceTable,
+        targetIds,
+
+        stage:
+            "chamber_digest",
+
+        scriptPath:
+        CHAMBER_DIGEST_SCRIPT,
+
+        successMessage:
+            "✅ Chamber digest stage completed successfully.",
+    });
 }
 
 function resolveSourceTable(value) {
@@ -644,11 +680,22 @@ function runFtnEnrichment(
     return spawnWorkflowStage({
         sourceTable,
         targetIds,
-        stage: "ftn_enrichment",
-        scriptPath: FTN_ENRICHMENT_SCRIPT,
+
+        stage:
+            "ftn_enrichment",
+
+        scriptPath:
+        FTN_ENRICHMENT_SCRIPT,
+
         successMessage:
             `✅ FTN enrichment completed successfully ` +
             `for ${sourceTable}.`,
+
+        onSuccess: () =>
+            runChamberDigest(
+                sourceTable,
+                targetIds,
+            ),
     });
 }
 

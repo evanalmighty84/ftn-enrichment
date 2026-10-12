@@ -90,6 +90,7 @@ each business ACTUALLY provides.
 
 You are classifying the BUSINESS — not the Chamber's generic category.
 
+
 The only allowed industry values are:
 
 ${JSON.stringify(ALLOWED_LEAD_TYPES)}
@@ -133,6 +134,31 @@ Do not classify commercial builders, engineering firms, developers,
 suppliers, or unrelated construction companies as
 "general_contractor" unless they actually provide the type of
 residential/home contracting service represented by our leads.
+
+IMPORTANT RESEARCH RULE:
+
+Do not rely only on industry_guess.
+
+When the company name or Chamber category is ambiguous, use reliable
+public information about that specific business to determine its
+actual services before returning [].
+
+Return [] only when you cannot establish that the business provides
+one of the supported services.
+HVAC:
+
+Use "hvac" for businesses that provide heating, air conditioning,
+AC repair, furnace repair, HVAC installation, HVAC maintenance,
+indoor comfort systems, or similar heating/cooling services.
+
+Do not reject a business merely because its Chamber category says
+"Energy Services", "Home Services", or another broad category.
+
+Use the business name and reliable public information to determine
+what the company actually does.
+
+If reliable information shows that a company performs HVAC work,
+classify it as "hvac" even when the Chamber industry_guess is vague.
 
 BOOKKEEPER:
 
