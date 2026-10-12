@@ -193,20 +193,25 @@ async function loadLeadBatch(
 
             FROM familytreenow f
 
-            WHERE $1 = ANY (
-                regexp_split_to_array(
-                        TRIM(
-                                BOTH '{}'
-                                FROM LOWER(
-                                        COALESCE(
-                                                f.lead_type,
-                                                ''
-                                        )
-                                     )
-                        ),
-                        '\\\\s*,\\\\s*'
-                )
-                )
+            WHERE
+                $1 = ANY(
+                    string_to_array(
+                            TRIM(
+                                    BOTH '{}'
+                                    FROM LOWER(
+                                            REPLACE(
+                                                    COALESCE(
+                                                            f.lead_type,
+                                                            ''
+                                                    ),
+                                                    ' ',
+                                                    ''
+                                            )
+                                         )
+                            ),
+                            ','
+                    )
+                    )
 
               AND NULLIF(
                     BTRIM(f.description),
@@ -214,37 +219,37 @@ async function loadLeadBatch(
                   ) IS NOT NULL
 
               AND (
-                    $3::int <= 0
+                $3::int <= 0
 
-                    OR f.scraped_at >=
-                       NOW() -
-                       (
-                           $3::int *
-                           INTERVAL '1 day'
-                       )
-              )
+                OR f.scraped_at >=
+                   NOW() -
+                   (
+                       $3::int *
+                       INTERVAL '1 day'
+                   )
+                )
 
               AND NOT EXISTS (
-                    SELECT 1
+                SELECT 1
 
-                    FROM chamber_lead_email_log log
+                FROM chamber_lead_email_log log
 
-                    WHERE
-                        log.lead_id = f.id
+                WHERE
+                    log.lead_id = f.id
 
-                      AND LOWER(
-                            BTRIM(log.recipient_email)
-                          ) =
-                          LOWER(
-                            BTRIM($2)
-                          )
-              )
+                  AND LOWER(
+                              BTRIM(log.recipient_email)
+                      ) =
+                      LOWER(
+                              BTRIM($2)
+                      )
+            )
 
             ORDER BY
                 f.scraped_at DESC,
-                f.id ASC
+                f.id DESC
 
-            LIMIT ${DIGEST_SIZE};
+                LIMIT ${DIGEST_SIZE};
         `,
         [
             industry,
