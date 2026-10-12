@@ -1,0 +1,43 @@
+"use strict";
+
+const ALLOWED_LEAD_TYPES = Object.freeze([
+    "auto_body",
+    "bookkeeper",
+    "christmas_lights",
+    "commercial_lending",
+    "concrete",
+    "dentist",
+    "doors",
+    "electrician",
+    "fencing",
+    "flooring",
+    "garage",
+    "general_contractor",
+    "handyman",
+    "homecare",
+    "house_cleaner",
+    "hvac",
+    "insurance",
+    "interior_designer",
+    "junk_removal",
+    "landscaping",
+    "lawn_care",
+    "lighting",
+    "mold",
+    "mover",
+    "painter",
+    "pest_control",
+    "pet_sitter",
+    "plumber",
+    "pool",
+    "power_washing",
+    "realtor",
+    "roofer",
+    "siding",
+    "security",
+    "windows",
+]);
+
+module.exports = {
+    ALLOWED_LEAD_TYPES,
+};

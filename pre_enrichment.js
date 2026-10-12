@@ -104,43 +104,9 @@ const PPLX_BATCH_SIZE = parseInt(
    atomic trades. A post may have more than one. If none fit, use an empty
    array.
 */
-const ALLOWED_LEAD_TYPES = [
-    "auto_body",
-    "bookkeeper",
-    "christmas_lights",
-    "commercial_lending",
-    "concrete",
-    "dentist",
-    "doors",
-    "electrician",
-    "fencing",
-    "flooring",
-    "garage",
-    "general_contractor",
-    "handyman",
-    "homecare",
-    "house_cleaner",
-    "hvac",
-    "insurance",
-    "interior_designer",
-    "junk_removal",
-    "landscaping",
-    "lawn_care",
-    "lighting",
-    "mold",
-    "mover",
-    "painter",
-    "pest_control",
-    "pet_sitter",
-    "plumber",
-    "pool",
-    "power_washing",
-    "realtor",
-    "roofer",
-    "siding",
-    "security",
-    "windows",
-];
+const {
+    ALLOWED_LEAD_TYPES
+} = require("./lead_types");
 
 const ALLOWED_SET = new Set(ALLOWED_LEAD_TYPES);
 
@@ -266,6 +232,32 @@ Examples include caregiver needs, senior care, elderly care, companion care, dem
 
 The author does NOT need to explicitly use the words "home care" or "caregiver." Infer the need from the situation described.
 
+
+WINDOWS / DOORS / SIDING:
+
+Use the lead_type "windows" for unresolved needs involving window
+replacement, window installation, broken or damaged windows, new windows,
+energy-efficient windows, window quotes, or requests for a window company.
+
+Use the lead_type "doors" for unresolved needs involving exterior or interior
+door replacement, door installation, entry doors, patio doors, sliding glass
+doors, French doors, damaged doors, or requests for a door company.
+
+Use the lead_type "siding" for unresolved needs involving siding replacement,
+siding repair, new siding, damaged siding, vinyl siding, fiber-cement siding,
+Hardie siding, engineered wood siding, or requests for a siding contractor.
+
+Do not classify these only as "general_contractor" or "handyman" when the
+author's primary unresolved need specifically involves windows, doors, or siding.
+
+When the post involves a larger remodel, multiple lead types may be used.
+
+Examples:
+- "Need quotes for replacement windows" → ["windows"]
+- "Looking for someone to replace my front door" → ["doors"]
+- "Who installs Hardie siding?" → ["siding"]
+- "Remodeling the exterior and replacing windows and siding"
+  → ["general_contractor", "windows", "siding"]
 BOOKKEEPING / BUSINESS FINANCIAL HELP:
 Posts from business owners, self-employed people, contractors, organizations, or individuals needing help with bookkeeping, QuickBooks, bookkeeping cleanup, catching up books, reconciling accounts, categorizing transactions, financial reporting, financial dashboards, profit-and-loss reporting, bookkeeping systems, correcting bookkeeping problems, or ongoing bookkeeping support.
 
