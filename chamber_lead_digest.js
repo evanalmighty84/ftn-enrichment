@@ -69,6 +69,11 @@ const pool = buildPool();
  * ----------------------------------------------------------------------- */
 
 const DIGEST_SIZE = 10;
+const CHAMBER_DIGEST_COOLDOWN_HOURS =
+    Number.parseInt(
+        process.env.CHAMBER_DIGEST_COOLDOWN_HOURS || "24",
+        10,
+    );
 
 const ENABLED =
     /^(1|true|yes)$/i.test(
@@ -143,32 +148,87 @@ async function loadRecipients() {
 
             WHERE
                 NULLIF(
-                    BTRIM(c.email),
-                    ''
+                        BTRIM(c.email),
+                        ''
                 ) IS NOT NULL
 
               AND CARDINALITY(
-                    COALESCE(
-                        c.lead_industries,
-                        ARRAY[]::text[]
-                    )
+                          COALESCE(
+                                  c.lead_industries,
+                                  ARRAY[]::text[]
+                          )
                   ) > 0
 
+
+                /*
+                 * ---------------------------------------------
+                 * Skip unsubscribed recipients.
+                 * ---------------------------------------------
+                 */
+
               AND NOT EXISTS (
-                    SELECT 1
-                    FROM chamber_email_unsubscribes u
+                SELECT 1
 
-                    WHERE
-                        LOWER(BTRIM(u.email)) =
-                        LOWER(BTRIM(c.email))
+                FROM chamber_email_unsubscribes u
 
-                      AND u.unsubscribed_at
-                          IS NOT NULL
-              )
+                WHERE
+                    LOWER(
+                            BTRIM(u.email)
+                    ) =
+                    LOWER(
+                            BTRIM(c.email)
+                    )
+
+                  AND u.unsubscribed_at
+                    IS NOT NULL
+            )
+
+
+                /*
+                 * ---------------------------------------------
+                 * 24-hour recipient cooldown.
+                 *
+                 * If this email received ANY Chamber digest
+                 * in the last X hours, don't process it.
+                 *
+                 * Include pending as well as sent so that an
+                 * uncertain SMTP/database state cannot cause
+                 * a duplicate email.
+                 * ---------------------------------------------
+                 */
+
+              AND NOT EXISTS (
+                SELECT 1
+
+                FROM chamber_lead_email_log log
+
+                WHERE
+                    LOWER(
+                            BTRIM(log.recipient_email)
+                    ) =
+                    LOWER(
+                            BTRIM(c.email)
+                    )
+
+                  AND log.status IN (
+                                     'pending',
+                                     'sent'
+                    )
+
+                  AND log.sent_at >=
+                      NOW() -
+                      (
+                          $1::int *
+                          INTERVAL '1 hour'
+                          )
+            )
 
             ORDER BY
                 c.id ASC;
         `,
+        [
+            CHAMBER_DIGEST_COOLDOWN_HOURS,
+        ],
     );
 
     return rows;
@@ -489,6 +549,13 @@ async function main() {
                     `${result.batch_id || "(unknown)"} ` +
                     `to ${email}.`,
                 );
+
+                /*
+                 * One successful digest max
+                 * per recipient during this run.
+                 */
+                break;
+
             } catch (error) {
                 failed += 1;
 
