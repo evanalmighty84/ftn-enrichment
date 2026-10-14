@@ -99,11 +99,22 @@ RUN npx --yes playwright-core install chromium || \
 # ----------------------------------------------------------------------------
 # Copy the enrichment script and Railway entrypoint
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Copy application scripts
+# ----------------------------------------------------------------------------
+
 COPY pre_enrichment.js ./
 COPY ftn_enrichment.js ./
+
+COPY lead_types.js ./
+
+COPY chamber_classify.js ./
+COPY chamber_lead_digest.js ./
+
 COPY fix-ftn-location-fallback.js ./
 COPY ftn-trigger-server.js ./
 COPY railway-entrypoint-ftn.sh ./
+
 COPY mckinney_neighborhoods_polygons.json ./
 
 # Revert the unsafe direct-text city fallback introduced on Sept. 30.
