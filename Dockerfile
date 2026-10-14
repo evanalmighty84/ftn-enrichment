@@ -236,6 +236,13 @@ RUN chmod +x /app/railway-entrypoint-ftn.sh
 # Railway mounts the configured service volume to /data.
 # ----------------------------------------------------------------------------
 
+# ----------------------------------------------------------------------------
+# Create persistent-volume mount directory.
+#
+# Do not add a Docker VOLUME instruction here.
+# Railway mounts the configured service volume to /data.
+# ----------------------------------------------------------------------------
+
 RUN mkdir -p /data
 
 
@@ -245,8 +252,4 @@ RUN mkdir -p /data
 # Provides reliable signal handling and cleans up zombie Chromium processes.
 # ----------------------------------------------------------------------------
 
-ENTRYPOINT [
-    "/usr/bin/tini",
-    "--",
-    "/app/railway-entrypoint-ftn.sh"
-]
+ENTRYPOINT ["/usr/bin/tini", "--", "/app/railway-entrypoint-ftn.sh"]
