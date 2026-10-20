@@ -27,7 +27,100 @@ const CHAMBER_DIGEST_TIMEOUT_MS =
         "CHAMBER_DIGEST_TIMEOUT_MS",
         10 * 60 * 1000,
     );
+const FTN_SERVICE_ROLE =
+    process.env.FTN_SERVICE_ROLE || "primary";
 
+const FTN_FAILOVER_ENABLED =
+    /^(1|true|yes)$/i.test(
+        String(process.env.FTN_FAILOVER_ENABLED || "0")
+    );
+
+const FTN_FAILOVER_URL =
+    String(process.env.FTN_FAILOVER_URL || "")
+        .replace(/\/+$/, "");
+
+async function triggerFailover({
+                                   sourceTable,
+                                   targetIds = [],
+                                   stage,
+                                   reason,
+                               }) {
+    if (
+        !FTN_FAILOVER_ENABLED ||
+        FTN_SERVICE_ROLE !== "primary" ||
+        !FTN_FAILOVER_URL
+    ) {
+        return false;
+    }
+
+    console.error(
+        `🚨 ${stage} failed for ${sourceTable}. ` +
+        `Sending workflow to standby FTN container.`
+    );
+
+    const controller = new AbortController();
+
+    const timer = setTimeout(
+        () => controller.abort(),
+        15_000,
+    );
+
+    try {
+        const response = await fetch(
+            `${FTN_FAILOVER_URL}/run`,
+            {
+                method: "POST",
+
+                headers: {
+                    "Content-Type": "application/json",
+                    "X-FTN-Failover": "1",
+                },
+
+                body: JSON.stringify({
+                    source_table: sourceTable,
+
+                    ids: targetIds.length
+                        ? targetIds
+                        : undefined,
+
+                    failover: {
+                        from: FTN_SERVICE_ROLE,
+                        failed_stage: stage,
+                        reason,
+                    },
+                }),
+
+                signal: controller.signal,
+            },
+        );
+
+        const body = await response
+            .json()
+            .catch(() => ({}));
+
+        if (!response.ok) {
+            throw new Error(
+                `standby returned HTTP ${response.status}: ` +
+                JSON.stringify(body),
+            );
+        }
+
+        console.log(
+            `✅ Standby accepted failed workflow: ` +
+            `${sourceTable} (${targetIds.length || "normal"} IDs).`
+        );
+
+        return true;
+    } catch (error) {
+        console.error(
+            `❌ FTN failover request failed: ${error.message}`,
+        );
+
+        return false;
+    } finally {
+        clearTimeout(timer);
+    }
+}
 function positiveIntegerFromEnv(name, fallback) {
     const value = Number(process.env[name]);
 
@@ -600,7 +693,7 @@ function spawnWorkflowStage({
         finishWorkflowAndContinue(child);
     });
 
-    child.once("exit", (code, signal) => {
+    child.once("exit", async (code, signal) => {
         if (
             failedToStart ||
             workflowProcess !== child
@@ -635,8 +728,15 @@ function spawnWorkflowStage({
         if (code !== 0) {
             console.error(
                 `❌ ${stage} exited with code ${code} ` +
-                `for ${sourceTable}.`,
+                `for ${sourceTable}.`
             );
+
+            await triggerFailover({
+                sourceTable,
+                targetIds,
+                stage,
+                reason: `exit_code_${code}`
+            });
 
             finishWorkflowAndContinue(child);
             return;
@@ -674,28 +774,18 @@ function runFtnEnrichment(
     targetIds = [],
 ) {
     console.log(
-        `▶️ Starting ftn_enrichment.js for ${sourceTable}...`,
+        `▶️ Starting ftn_enrichment.js for ${sourceTable}...`
     );
 
     return spawnWorkflowStage({
         sourceTable,
         targetIds,
-
-        stage:
-            "ftn_enrichment",
-
-        scriptPath:
-        FTN_ENRICHMENT_SCRIPT,
+        stage: "ftn_enrichment",
+        scriptPath: FTN_ENRICHMENT_SCRIPT,
 
         successMessage:
             `✅ FTN enrichment completed successfully ` +
-            `for ${sourceTable}.`,
-
-        onSuccess: () =>
-            runChamberDigest(
-                sourceTable,
-                targetIds,
-            ),
+            `for ${sourceTable}.`
     });
 }
 
