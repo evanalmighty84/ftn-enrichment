@@ -172,13 +172,16 @@ const MAX_PHONE_ATTEMPTS = Number(
 // ---- Smartproxy / multi-worker config ----
 // Mirrors your workerb.js setup: one proxy IP per worker.
 // Override with FTN_PROXIES (comma-separated) in .env.
+
+
 const PROXY_POOL = (
     process.env.FTN_PROXIES ||
-    "204.77.129.143,207.228.200.92,23.231.0.74"
+    "50.2.70.229,207.228.201.207"
 )
     .split(",")
-    .map((s) => s.trim())
+    .map(ip => ip.trim())
     .filter(Boolean);
+
 const PROXY_PORT = Number(process.env.FTN_PROXY_PORT || 6014);
 // Accept both the FTN_-prefixed names (existing/proven) and the bare
 // PROXY_USER / PROXY_PASS names documented in the Phase 2 README. The FTN_
