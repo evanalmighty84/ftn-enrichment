@@ -531,6 +531,86 @@ function resolveSearchLocations(city, state) {
     ];
 }
 
+// Research unknown neighborhoods through existing Perplexity Sonar credentials.
+// Only high-confidence same-state parent-city answers are accepted.
+const SONAR_LOCATION_CACHE = new Map();
+async function lookupParentCityWithSonar(locationName, state) {
+    const location = cleanText(locationName);
+    const stateCode = cleanText(state).toUpperCase();
+    const key = normalizeNeighborhoodKey(location) + "|" + stateCode;
+    if (SONAR_LOCATION_CACHE.has(key)) return SONAR_LOCATION_CACHE.get(key);
+    const apiKey = process.env.PERPLEXITY_API_KEY;
+    if (!apiKey) {
+        console.warn("[SONAR_LOCATION] PERPLEXITY_API_KEY not configured; keeping original location.");
+        return null;
+    }
+    try {
+        console.log("[SONAR_LOCATION] Researching " + location + ", " + stateCode);
+        const response = await fetch(
+            process.env.PPLX_API_URL || "https://api.perplexity.ai/chat/completions",
+            {
+                method: "POST",
+                headers: {
+                    Authorization: "Bearer " + apiKey,
+                    "Content-Type": "application/json",
+                    Accept: "application/json",
+                },
+                signal: AbortSignal.timeout(15000),
+                body: JSON.stringify({
+                    model: process.env.PPLX_MODEL || "sonar",
+                    temperature: 0,
+                    max_tokens: 350,
+                    return_citations: false,
+                    messages: [
+                        {
+                            role: "system",
+                            content: "Determine the actual municipality of a US neighborhood. Use geographic evidence rather than name similarity. If ambiguous or uncertain, return null. Respond ONLY JSON with city (string or null), state (two-letter string or null), confidence (high, medium or low), and reason (string)."
+                        },
+                        {
+                            role: "user",
+                            content: "What city or town contains the neighborhood or location named '" + location +
+                                "' in " + stateCode + ", USA? If already a city, say so. If several places share the name, return null unless unambiguous."
+                        },
+                    ],
+                }),
+            }
+        );
+        if (!response.ok) throw new Error("Sonar HTTP " + response.status);
+        const payload = await response.json();
+        const content = String(payload?.choices?.[0]?.message?.content || "");
+        const json = content.match(/\{[\s\S]*\}/);
+        if (!json) throw new Error("Sonar returned no JSON");
+        const answer = JSON.parse(json[0]);
+        const city = typeof answer.city === "string" ? cleanText(answer.city) : "";
+        const resultState = typeof answer.state === "string" ? cleanText(answer.state).toUpperCase() : "";
+        const validCity = /^[A-Za-z][A-Za-z .'-]{1,79}$/.test(city);
+        const accepted = validCity && resultState === stateCode &&
+            answer.confidence === "high" &&
+            normalizeNeighborhoodKey(city) !== normalizeNeighborhoodKey(location);
+        const resolved = accepted ? {
+            city, state: stateCode, source: "sonar",
+            neighborhood: location, neighborhoodId: null, slug: null
+        } : null;
+        console.log("[SONAR_LOCATION] " + location + " -> " +
+            (resolved ? city + ", " + stateCode : "unresolved") +
+            "; confidence=" + String(answer.confidence || "unknown") +
+            "; reason=" + String(answer.reason || "").slice(0, 150));
+        SONAR_LOCATION_CACHE.set(key, resolved);
+        return resolved;
+    } catch (error) {
+        console.warn("[SONAR_LOCATION] " + location + " lookup error: " + error.message);
+        return null;
+    }
+}
+async function resolveSearchLocationsWithSonar(city, state) {
+    const resolved = resolveSearchLocations(city, state);
+    if (resolved.length !== 1 || resolved[0].source !== "original") {
+        return resolved;
+    }
+    const sonar = await lookupParentCityWithSonar(city, state);
+    return sonar ? [sonar] : resolved;
+}
+
 // Title-case a name for searching: capitalize the first letter and any letter
 // following a space, apostrophe, or hyphen, while preserving other capitals.
 // Ensures "O'bier" / "o'bier" from the DB is searched as "O'Bier", and
@@ -3857,6 +3937,8 @@ async function enrichOneRowAtLocation(
             `"${searchCity}, ${searchState}" using ` +
             `${DFW_POLYGON_FILE}.`,
         );
+    } else if (resolvedLocation.source === "sonar") {
+        console.log("[SONAR_LOCATION] Using parent city " + searchCity + ", " + searchState + " for " + city + ", " + state);
     } else if (resolvedLocation.source === "override") {
         console.log(
             `[LOCATION] Override: ${city}, ${state} -> ` +
@@ -4103,7 +4185,7 @@ async function enrichOneRow(page, row) {
     }
 
     const searchLocations =
-        resolveSearchLocations(city, state);
+        await resolveSearchLocationsWithSonar(city, state);
 
     console.log(
         `[LOCATION] "${city}, ${state}" has ` +
