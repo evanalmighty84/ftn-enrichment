@@ -191,7 +191,7 @@ const PROXY_USER =
 const PROXY_PASS =
     process.env.FTN_PROXY_PASS || process.env.PROXY_PASS || "viWjWbPWNUVgWG0b";
 const WORKER_COUNT = Number(
-    process.env.FTN_WORKER_COUNT || Math.min(PROXY_POOL.length, 3) || 1,
+    process.env.FTN_WORKER_COUNT || Math.min(PROXY_POOL.length, 2) || 1,
 );
 const WARM_UP_ENABLED = String(process.env.FTN_WARM_UP || "1") !== "0";
 const BROWSER_MODE = (
@@ -3834,6 +3834,11 @@ async function logNoPhoneDiagnostics(page, person) {
     }
 }
 
+async function isExplicitFtnRateLimit(page) {
+    const body = await page.locator('body').innerText({timeout:3000}).catch(()=>'');
+    return /this IP address has been temporarily rate-limited|rate limit exceeded|too many requests/i.test(body);
+}
+
 async function enrichOneRowAtLocation(
     page,
     row,
@@ -3867,6 +3872,10 @@ async function enrichOneRowAtLocation(
     console.log("============================================================");
 
     await openFamilyTreeNow(page);
+    if (await isExplicitFtnRateLimit(page)) {
+        console.warn(`[RATE_LIMIT] ID ${row.id}: explicit FTN limit; no proxy failover.`);
+        return { status: 'rate_limited' };
+    }
 
     const {
         cityStateInput,
@@ -3883,9 +3892,11 @@ async function enrichOneRowAtLocation(
         );
 
     if (!selectedLocation) {
-        return {
-            status: "location_not_selected",
-        };
+        if (await isExplicitFtnRateLimit(page)) {
+            console.warn(`[RATE_LIMIT] ID ${row.id}: explicit FTN limit during autocomplete.`);
+            return { status: 'rate_limited' };
+        }
+        return { status: 'location_not_selected' };
     }
 
     // Fill and verify both names only after the city autocomplete has
@@ -4140,7 +4151,7 @@ async function enrichOneRow(page, row) {
          * actually produced the successful FTN match, so contractor
          * routing and insertion continue working unchanged.
          */
-        if (result.status === "updated") {
+        if (result.status === "updated" || result.status === "rate_limited") {
             return result;
         }
 
@@ -4575,7 +4586,12 @@ async function runEnrichmentLoop(
         no_mobile_phone: 0,
         already_updated: 0,
         failed: 0,
+        rate_limited: 0,
+        worker_quarantined: 0,
     };
+    let consecutiveLocationFailures = 0;
+    let sessionQuarantined = false;
+    const isRetryPass = process.env.FTN_RETRY_PASS === "1";
 
     for (
         let index = 0;
@@ -4583,6 +4599,13 @@ async function runEnrichmentLoop(
         index += 1
     ) {
         const row = rows[index];
+        if (sessionQuarantined) {
+            totals.worker_quarantined += 1;
+            console.warn(`[QUARANTINE] W${workerIndex} held ID ${row.id}; session unhealthy.`);
+            process.send?.({type:"row_result",workerIndex,leadId:row.id,
+                status:"worker_quarantined",proxyIp:session.proxyIp,retryPass:isRetryPass});
+            continue;
+        }
 
         console.log(
             `\n[W${workerIndex} ${index + 1}/${rows.length}] ` +
@@ -4705,6 +4728,21 @@ async function runEnrichmentLoop(
         }
 
         if (handled && result) {
+            process.send?.({type:"row_result",workerIndex,leadId:row.id,
+                status:result.status,proxyIp:session.proxyIp,retryPass:isRetryPass});
+            if (result.status === "location_not_selected") {
+                consecutiveLocationFailures++;
+                console.warn(`[HEALTH] W${workerIndex} location-selection failure ${consecutiveLocationFailures}; proxy ${session.proxyIp}.`);
+                if (consecutiveLocationFailures >= 2) {
+                    sessionQuarantined = true;
+                    console.warn(`[QUARANTINE] W${workerIndex} halted after repeated location failures.`);
+                }
+            } else if (result.status === "rate_limited") {
+                sessionQuarantined = true;
+                console.warn(`[RATE_LIMIT] W${workerIndex}: stop requests; do not fail over to another IP.`);
+            } else {
+                consecutiveLocationFailures = 0;
+            }
             totals[result.status] =
                 (totals[result.status] || 0) + 1;
 
@@ -5076,6 +5114,8 @@ async function runMaster() {
     const exitCodes = [];
     const workers = [];
     const workerReports = [];
+    const rowOutcomes = [];
+    const proxyByWorker = new Map();
 
     for (let i = 0; i < WORKER_COUNT; i += 1) {
         const proxyIp = PROXY_POOL[i % PROXY_POOL.length] || "";
@@ -5102,6 +5142,9 @@ async function runMaster() {
         child.on("message", (msg) => {
             if (msg && msg.type === "totals") {
                 workerReports.push(msg);
+            } else if (msg && msg.type === "row_result") {
+                rowOutcomes.push(msg);
+                if (msg.proxyIp) proxyByWorker.set(msg.workerIndex,msg.proxyIp);
             }
         });
 
@@ -5129,6 +5172,54 @@ async function runMaster() {
         ` All workers finished. Exit codes: ` +
         `${exitCodes.join(", ")}`,
     );
+
+    // A secondary, sequential pass for pending session/autocomplete failures.
+    // Do not retry explicit site rate limits or genuine no-match responses.
+    const initialWorkerFailed = exitCodes.some(code => code !== 0);
+    const rateLimited = rowOutcomes.some(o => o.status === "rate_limited");
+    const goodWorkers = workerReports.filter(report => {
+        const outcomes = rowOutcomes.filter(o => o.workerIndex === report.workerIndex && !o.retryPass);
+        return outcomes.some(o => ["updated","no_matching_result","no_mobile_phone"].includes(o.status)) &&
+            !outcomes.some(o => ["location_not_selected","rate_limited"].includes(o.status));
+    }).sort((a,b)=>a.workerIndex-b.workerIndex);
+    const retryIds = [...new Set(rowOutcomes
+        .filter(o => !o.retryPass && ["location_not_selected","worker_quarantined"].includes(o.status))
+        .map(o=>o.leadId))];
+    if (!initialWorkerFailed && !rateLimited && retryIds.length && goodWorkers.length) {
+        const healthy = goodWorkers[0];
+        const healthyProxy = proxyByWorker.get(healthy.workerIndex) ||
+            PROXY_POOL[healthy.workerIndex % PROXY_POOL.length];
+        const retryRows = rows.filter(row => retryIds.includes(row.id));
+        const pending = await pool.query(
+            `SELECT id FROM ${TABLE_NAME} WHERE id = ANY($1::int[]) AND is_lead = true AND ftn_enriched_at IS NULL`,
+            [retryRows.map(row=>row.id)]
+        );
+        const pendingIds = new Set(pending.rows.map(row=>Number(row.id)));
+        const safeRetryRows = retryRows.filter(row=>pendingIds.has(row.id));
+        if (safeRetryRows.length) {
+            const file = path.join(os.tmpdir(),`ftn-retry-${Date.now()}.json`);
+            await fs.promises.writeFile(file,JSON.stringify(safeRetryRows));
+            console.log(`[FAILOVER] Reassigning ${safeRetryRows.length} pending lead(s) to healthy W${healthy.workerIndex} proxy ${healthyProxy}; one retry pass.`);
+            const child = fork(__filename,[],{
+                env:{...process.env,FTN_WORKER:"1",FTN_RETRY_PASS:"1",
+                    WORKER_INDEX:String(healthy.workerIndex),FTN_BATCH_FILE:file,FTN_PROXY_IP:healthyProxy},
+                stdio:["ignore","pipe","pipe","ipc"]
+            });
+            child.stdout.on("data",buf=>console.log(`[RETRY W${healthy.workerIndex}]: ${String(buf).trimEnd()}`));
+            child.stderr.on("data",buf=>console.error(`[RETRY W${healthy.workerIndex}]: ${String(buf).trimEnd()}`));
+            child.on("message",msg=>{
+                if(msg?.type==="totals")workerReports.push(msg);
+                else if(msg?.type==="row_result")rowOutcomes.push(msg);
+            });
+            const retryExit = await new Promise(resolve=>child.on("exit",resolve));
+            await removeTempArtifact(file,"master retry batch file");
+            exitCodes.push(retryExit);
+            console.log(`[FAILOVER] Retry worker exit=${retryExit}; no further same-run retry.`);
+        }
+    } else if (retryIds.length) {
+        console.log(`[FAILOVER] ${retryIds.length} pending lead(s) left for next run: `+
+            (rateLimited?"FTN rate limit":initialWorkerFailed?"worker crash; standby handoff":"no proven healthy worker"));
+    }
 
     const grand = printGrandTotals(workerReports, rows.length);
 
@@ -5167,6 +5258,8 @@ function printGrandTotals(reports, totalRowsLoaded) {
         no_mobile_phone: 0,
         already_updated: 0,
         failed: 0,
+        rate_limited: 0,
+        worker_quarantined: 0,
     };
 
     let rowsProcessed = 0;
